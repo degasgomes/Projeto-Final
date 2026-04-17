@@ -14,6 +14,11 @@ Projeto em Rust com:
 - Comando Discord `/createcontract` para criacao guiada de contrato PARTS
 - Memoria de contexto multi-turno por utilizador/canal
 - Comando `/ask_reset` para limpar contexto
+- Conversas multiplas por utilizador/canal (`/ask_new`, `/ask_use`, `/ask_list`)
+- Resumo de conversa a qualquer momento (`/ask_summary`)
+- Gestao de conversas (`/ask_delete`, `/ask_rename`)
+- Exportacao de resumo para Markdown (`/ask_export`)
+- Persistencia local de conversas em JSON entre reinicios
 - Fallback automatico de Gemini para OpenRouter em erro de quota (`429`)
 
 ## Requisitos
@@ -36,6 +41,8 @@ GEMINI_API_KEY=sua_chave_gemini
 GEMINI_MODEL=gemini-2.0-flash
 OPENROUTER_API_KEY=sua_chave_openrouter
 OPENROUTER_MODEL=openrouter/auto
+CONVERSATIONS_STORE_PATH=data/conversations.json
+CONVERSATION_EXPORT_DIR=data/exports
 ```
 
 Notas:
@@ -59,6 +66,13 @@ Sem `DISCORD_GUILD_ID`, os comandos sao globais e podem demorar alguns minutos a
 - `/parts tema:<assunto>`: explica P-A-R-T-S e devolve um contrato pronto para aprender o tema
 - `/createcontract`: inicia criacao **completa** de contrato PARTS com 7 perguntas guiadas (tema, publico, persona, acao, responsabilidades, estrutura, expectativas)
 - `/ask_reset`: limpa memoria da conversa
+- `/ask_new nome:<texto>`: cria e ativa nova conversa
+- `/ask_use nome:<texto>`: ativa conversa existente
+- `/ask_list`: lista conversas e indica a ativa
+- `/ask_summary [nome:<texto>]`: resume a conversa ativa (ou uma conversa especifica)
+- `/ask_delete nome:<texto>`: apaga uma conversa
+- `/ask_rename atual:<texto> novo:<texto>`: renomeia conversa
+- `/ask_export [nome:<texto>]`: exporta resumo da conversa para ficheiro Markdown
 
 ## Como usar /createcontract
 
@@ -118,6 +132,8 @@ GEMINI_API_KEY=sua_chave_gemini
 GEMINI_MODEL=gemini-2.0-flash
 OPENROUTER_API_KEY=sua_chave_openrouter
 OPENROUTER_MODEL=openrouter/auto
+CONVERSATIONS_STORE_PATH=data/conversations.json
+CONVERSATION_EXPORT_DIR=data/exports
 ```
 
 Servico:
@@ -138,3 +154,12 @@ journalctl -u projeto_final -f
 
 - Nao publiques tokens/chaves em screenshots, commits ou chats.
 - Se uma chave for exposta, revoga e cria outra.
+
+## Release v1.0.0
+
+- Fluxo PARTS reforcado para nao terminar por limite de interacoes; termina apenas quando o estudante confirma que percebeu.
+- Conversas multiplas por utilizador/canal com conversa ativa selecionavel.
+- Resumo em qualquer momento da conversa ativa ou por nome.
+- Persistencia de conversas em disco (JSON) para manter contexto apos reinicio.
+- Exportacao de resumo para Markdown em `data/exports`.
+- Novos comandos: `/ask_new`, `/ask_use`, `/ask_list`, `/ask_summary`, `/ask_delete`, `/ask_rename`, `/ask_export`.
