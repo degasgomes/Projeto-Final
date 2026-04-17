@@ -1,0 +1,31 @@
+openapi: 3.0.3
+info:
+  title: ProjetoFinal API
+  version: 0.1.0
+  description: API inicial para integração com Discord e IA generativa
+paths:
+  /status:
+    get:
+      summary: Estado dos módulos da aplicação
+      responses:
+        '200':
+          description: Estado atual
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+
+components:
+  schemas:
+    StatusResponse:
+      type: object
+      required:
+        - api
+        - bot
+      properties:
+        api:
+          type: string
+          example: api-ok
+        bot:
+          type: string
+          example: bot-ok

@@ -1,0 +1,41 @@
+[
+  {
+    "channel_id": 1476527766408265853,
+    "user_id": 503607986821005314,
+    "data": {
+      "active_id": "teste_2",
+      "conversations": {
+        "principal": {
+          "name": "Principal",
+          "turns": []
+        },
+        "teste_1": {
+          "name": "teste 1",
+          "turns": [
+            {
+              "user": "o que o rust",
+              "assistant": "\"O Rust\" pode ter vários significados dependendo do contexto, pois é uma palavra que aparece em diferentes áreas. Para que eu possa te dar a resposta mais precisa, você poderia me dizer em qual contexto você ouviu ou leu sobre \"o Rust\"?\n\nPor exemplo, você se refere a:\n\n*   **Metais/Química:** A ferrugem que se forma em metais como o ferro?\n*   **Embalagens/Alimentos:** Um tipo de embalagem ou ingrediente alimentar?\n*   **Outro assunto?**\n\nAssim que você me der mais informações, poderei explicar o que \"o Rust\" significa nesse caso específico!"
+            },
+            {
+              "user": "a linguagem rust",
+              "assistant": "Ah, entendi! Nesse caso, \"Rust\" se refere a uma **linguagem de programação**.\n\nRust é uma linguagem de programação de sistemas com foco em:\n\n*   **Segurança de memória:** Rust garante a segurança de memória em tempo de compilação, o que significa que muitos erros comuns que levam a bugs de segurança em outras linguagens (como acesso a memória inválida) são evitados antes mesmo que o programa seja executado. Isso é feito com um sistema de \"ownership\" e \"borrowing\" muito rigoroso.\n*   **Concorrência sem data races:** Rust permite a escrita de código concorrente (que executa várias tarefas ao mesmo tempo) de forma segura, prevenindo os perigosos \"data races\" (onde múltiplas partes de um prog..."
+            }
+          ]
+        },
+        "teste_2": {
+          "name": "teste 2",
+          "turns": [
+            {
+              "user": "seal team e uma boa serie",
+              "assistant": "I'm glad to hear that you enjoy \"Seal Team\"! It's a gripping and realistic military drama that follows the lives of the Navy SEALs as they carry out high-stakes missions. If you have any specific questions about the show or its characters, feel free to ask! And please let me know when you feel you have a good understanding of the topic before we move on to something new."
+            },
+            {
+              "user": "estava a perguntar se e boa",
+              "assistant": "Como mencionei anteriormente, a série \"Seal Team\" é considerada uma boa série por muitos, pois é envolvente e realista, seguindo as missões de alto risco dos Navy SEALs.\n\nSe tiver mais alguma questão sobre a série ou quiser discutir algum aspeto em particular, é só dizer! E não se esqueça de me informar quando sentir que compreendeu o tópico antes de passarmos para outra coisa."
+            }
+          ]
+        }
+      }
+    }
+  }
+]
