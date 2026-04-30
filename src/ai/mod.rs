@@ -9,6 +9,7 @@ use tokio::time::sleep;
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_RETRIES: usize = 2;
+const DISCORD_FORMAT_INSTRUCTION: &str = "Formate a mensagem para Discord:\n1. Responda de forma incremental, como uma conversa normal. Mostre apenas o que e novo nesta mensagem; nao repitas o que ja foi dito antes, nem reescrevas o contexto, a introducao ou os titulos anteriores.\n2. Se houver continuidade de uma resposta anterior, continua diretamente a partir dela sem refazer o resumo inicial.\n3. Respeite a formatacao de texto do Discord (negrito, italico, listas, etc).\n4. Limite maximo por mensagem: 2000 caracteres. Nao quebre formatacao a meio de blocos.\n5. IMPORTANTE: Todo codigo deve estar em code blocks com language identifier. Exemplos: ```html, ```css, ```javascript, ```python, ```rust, etc. Isto garante syntax highlighting com cores no Discord.";
 
 #[derive(Debug)]
 pub enum AiError {
@@ -120,14 +121,19 @@ pub async fn submit_prompt(prompt: &str) -> Result<String, AiError> {
         return Err(AiError::EmptyPrompt);
     }
 
-    match submit_with_gemini(trimmed_prompt).await {
+    let final_prompt = format!(
+        "Instrucoes de formatacao obrigatorias:\n{}\n\nPedido:\n{}",
+        DISCORD_FORMAT_INSTRUCTION, trimmed_prompt
+    );
+
+    match submit_with_gemini(&final_prompt).await {
         Ok(text) => Ok(text),
         Err(AiError::ApiError {
             status: StatusCode::TOO_MANY_REQUESTS,
             body,
         }) => {
             if env::var("OPENROUTER_API_KEY").is_ok() {
-                submit_with_openrouter(trimmed_prompt).await
+                submit_with_openrouter(&final_prompt).await
             } else {
                 Err(AiError::ApiError {
                     status: StatusCode::TOO_MANY_REQUESTS,
