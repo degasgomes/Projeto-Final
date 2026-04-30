@@ -1,98 +1,116 @@
 # ProjetoFinal
 
-Projeto em Rust com:
-- Bot Discord
-- Backend com OpenAPI
-- Integração com IA generativa
+Projeto em Rust com bot Discord, API HTTP e integracao com IA generativa.
 
 ## Funcionalidades
 
 - API HTTP de status em `GET /status`
-- Comando Discord `/status`
-- Comando Discord `/ask prompt:<texto>`
-- Comando Discord `/parts tema:<assunto>` para gerar contrato PARTS
-- Comando Discord `/createcontract` para criacao guiada de contrato PARTS
-- Memoria de contexto multi-turno por utilizador/canal
-- Comando `/ask_reset` para limpar contexto
-- Conversas multiplas por utilizador/canal (`/ask_new`, `/ask_use`, `/ask_list`)
-- Resumo de conversa a qualquer momento (`/ask_summary`)
-- Gestao de conversas (`/ask_delete`, `/ask_rename`)
-- Exportacao de resumo para Markdown (`/ask_export`)
-- Persistencia local de conversas em JSON entre reinicios
+- Comando `/ask` com memoria curta de contexto
+- Conversa normal unica por utilizador/canal: `principal`
+- Comando `/conversation_clear` para limpar a conversa principal
+- Comando `/parts` para gerar contrato PARTS rapido por tema
+- Comando `/createcontract` com criacao guiada (7 perguntas)
+- Catalogo de contratos (`/contract_upload`, `/contract_list`, `/contract_remove`)
+- Sessao de aprendizagem por contrato (`/contract_start`, `/contract_pause`, `/contract_restore`)
+- Resumo de execucao por contrato (`/contract_summary`)
+- Resumo e listagem de sessoes (`/contract_session_summary`, `/contract_sessions`)
+- Persistencia local em JSON entre reinicios:
+	- conversas normais
+	- catalogo de contratos
+	- resumos de execucao de contratos
+	- sessoes de contrato
 - Fallback automatico de Gemini para OpenRouter em erro de quota (`429`)
 
 ## Requisitos
 
 - Rust + Cargo
-- Token de bot Discord
+- Token do bot Discord
 - Chave Gemini (`GEMINI_API_KEY`)
-- Opcional: chave OpenRouter para fallback (`OPENROUTER_API_KEY`)
+- Opcional: chave OpenRouter (`OPENROUTER_API_KEY`)
 
 ## Execucao local
 
-Cria um ficheiro `.env` na raiz do projeto com este conteudo:
+Cria um ficheiro `.env` na raiz do projeto:
 
 ```env
 DISCORD_TOKEN=seu_token_do_bot
 DISCORD_GUILD_ID=id_do_servidor_opcional
 DISCORD_ENABLE_MESSAGE_CONTENT=0
 PORT=3001
+
 GEMINI_API_KEY=sua_chave_gemini
 GEMINI_MODEL=gemini-2.0-flash
+
 OPENROUTER_API_KEY=sua_chave_openrouter
 OPENROUTER_MODEL=openrouter/auto
+
 CONVERSATIONS_STORE_PATH=data/conversations.json
-CONVERSATION_EXPORT_DIR=data/exports
+CONTRACTS_STORE_PATH=data/contracts.json
+CONTRACT_SUMMARIES_STORE_PATH=data/contract_summaries.json
+CONTRACT_SESSIONS_STORE_PATH=data/contract_sessions.json
 ```
 
 Notas:
-- `DISCORD_ENABLE_MESSAGE_CONTENT=1` so se ativares tambem o **Message Content Intent** no Discord Developer Portal.
-- Se estiver a `0`, o bot arranca sem esse intent e o `/createcontract` mostra instrucoes para ativacao.
+- `DISCORD_ENABLE_MESSAGE_CONTENT=1` exige ativar tambem o Message Content Intent no Discord Developer Portal.
+- Se estiver a `0`, fluxos guiados por mensagem normal (ex.: `/createcontract` e upload pendente sem conteudo no slash) ficam limitados.
 
-Depois executa:
+Executa:
 
 ```bash
 cargo run
 ```
 
-Se definir `DISCORD_GUILD_ID`, os comandos sao registrados nessa guild e aparecem quase instantaneamente.
-Sem `DISCORD_GUILD_ID`, os comandos sao globais e podem demorar alguns minutos a propagar.
+Se definires `DISCORD_GUILD_ID`, os comandos aparecem quase instantaneamente na guild.
+Sem `DISCORD_GUILD_ID`, os comandos sao globais e podem demorar alguns minutos.
 
 ## Comandos Discord
 
-- `/status`: mostra estado da API e bot
-- `/hello`: responde "hello world!"
-- `/ask prompt:<pergunta>`: envia prompt para IA
-- `/parts tema:<assunto>`: explica P-A-R-T-S e devolve um contrato pronto para aprender o tema
-- `/createcontract`: inicia criacao **completa** de contrato PARTS com 7 perguntas guiadas (tema, publico, persona, acao, responsabilidades, estrutura, expectativas)
-- `/ask_reset`: limpa memoria da conversa
-- `/ask_new nome:<texto>`: cria e ativa nova conversa
-- `/ask_use nome:<texto>`: ativa conversa existente
-- `/ask_list`: lista conversas e indica a ativa
-- `/ask_summary [nome:<texto>]`: resume a conversa ativa (ou uma conversa especifica)
-- `/ask_delete nome:<texto>`: apaga uma conversa
-- `/ask_rename atual:<texto> novo:<texto>`: renomeia conversa
-- `/ask_export [nome:<texto>]`: exporta resumo da conversa para ficheiro Markdown
+### Conversa normal
 
-## Como usar /createcontract
+- `/ask prompt:<pergunta>`: pergunta para a IA usando a conversa principal
+- `/conversation_clear`: limpa o historico da conversa principal
 
-O comando `/createcontract` guia-te atraves de 7 perguntas para criar um contrato PARTS completo:
+### Contratos PARTS
 
-1. **Tema (T)**: O que queres aprender?
-2. **Publico** (contexto): Para quem é? Qual é o nível?
-3. **Persona (P)**: Que perfil tem o bot? (especialista, mentor, coach)
-4. **Acao (A)**: Como deve agir? Que metodologia? (socratica, prática, exemplos)
-5. **Responsabilidades (R)**: O que deve e não deve fazer?
-6. **Estrutura (S)**: Sequência de passos na interação?
-7. **Expectativas**: O que deverá o utilizador conseguir fazer?
+- `/parts tema:<assunto>`: gera contrato PARTS rapido
+- `/createcontract`: criacao guiada com 7 perguntas
+- `/contract_upload id:<id> titulo:<titulo> topico:<topico> [conteudo:<texto>]`: cria/atualiza contrato
+- `/contract_upload_finish`: finaliza upload pendente por mensagens
+- `/contract_upload_cancel`: cancela upload pendente
+- `/contract_list`: lista contratos registados
+- `/contract_remove id:<id>`: remove contrato
 
-O bot valida a persona com IA e gera um contrato PARTS estruturado, pronto para usar diretamente com `/ask`.
+### Sessoes de contrato
+
+- `/contract_start id:<id>`: inicia sessao com um contrato
+- `/contract_pause`: pausa a sessao ativa
+- `/contract_restore [id:<id>]`: retoma sessao pausada (ou associa contrato especifico)
+- `/contract_summary id:<contract_id>`: mostra o resumo de execucao de um contrato
+- `/contract_session_summary`: resume a sessao atual
+- `/contract_sessions`: lista sessoes abertas/pausadas do utilizador
+
+## Fluxo do upload de contrato
+
+Quando usas `/contract_upload` sem `conteudo`, o bot entra em modo de upload pendente para aquele utilizador/canal.
+
+1. Envia uma ou varias mensagens com o conteudo do contrato.
+2. Usa `/contract_upload_finish` para gravar.
+3. Usa `/contract_upload_cancel` para abortar.
+
+## Persistencia de dados
+
+- Conversas normais: `data/conversations.json`
+- Catalogo de contratos: `data/contracts.json`
+- Resumos de execucao: `data/contract_summaries.json`
+- Sessoes de contrato: `data/contract_sessions.json`
+
+As sessoes de contrato agora sobrevivem a reinicios do bot.
 
 ## API HTTP
 
 - `GET http://127.0.0.1:3000/status`
 
-Exemplo de resposta da API:
+Exemplo:
 
 ```text
 {"api":"api-ok","bot":"bot-ok"}
@@ -100,66 +118,11 @@ Exemplo de resposta da API:
 
 ## IA e fallback
 
-Fluxo atual:
-
 1. Tenta Gemini (`GEMINI_API_KEY`).
-2. Se Gemini devolver `429`, tenta OpenRouter (`OPENROUTER_API_KEY`).
-3. Se ambos falharem, devolve erro descritivo no Discord.
-
-## Producao (sempre online com systemd)
-
-Compilar e copiar binario:
-
-```bash
-cargo build --release
-sudo mkdir -p /opt/projeto_final
-sudo cp target/release/projeto_final /opt/projeto_final/projeto_final
-sudo chown -R botdiscord:botdiscord /opt/projeto_final
-```
-
-Ficheiro de ambiente:
-
-```bash
-sudo nano /etc/projeto_final.env
-```
-
-Conteudo exemplo:
-
-```env
-DISCORD_TOKEN=seu_token
-DISCORD_GUILD_ID=id_opcional
-GEMINI_API_KEY=sua_chave_gemini
-GEMINI_MODEL=gemini-2.0-flash
-OPENROUTER_API_KEY=sua_chave_openrouter
-OPENROUTER_MODEL=openrouter/auto
-CONVERSATIONS_STORE_PATH=data/conversations.json
-CONVERSATION_EXPORT_DIR=data/exports
-```
-
-Servico:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now projeto_final
-sudo systemctl status projeto_final --no-pager
-```
-
-Logs:
-
-```bash
-journalctl -u projeto_final -f
-```
+2. Em `429`, tenta OpenRouter (`OPENROUTER_API_KEY`).
+3. Se ambos falharem, devolve erro no Discord.
 
 ## Notas de seguranca
 
 - Nao publiques tokens/chaves em screenshots, commits ou chats.
 - Se uma chave for exposta, revoga e cria outra.
-
-## Release v1.0.0
-
-- Fluxo PARTS reforcado para nao terminar por limite de interacoes; termina apenas quando o estudante confirma que percebeu.
-- Conversas multiplas por utilizador/canal com conversa ativa selecionavel.
-- Resumo em qualquer momento da conversa ativa ou por nome.
-- Persistencia de conversas em disco (JSON) para manter contexto apos reinicio.
-- Exportacao de resumo para Markdown em `data/exports`.
-- Novos comandos: `/ask_new`, `/ask_use`, `/ask_list`, `/ask_summary`, `/ask_delete`, `/ask_rename`, `/ask_export`.

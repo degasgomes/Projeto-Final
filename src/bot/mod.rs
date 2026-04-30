@@ -1,13 +1,10 @@
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
-use serenity::model::application::command::Command;
-use serenity::model::application::command::CommandOptionType;
 use serenity::model::application::interaction::application_command::ApplicationCommandInteraction;
 use serenity::model::application::interaction::{Interaction, InteractionResponseType};
 use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::model::gateway::GatewayIntents;
-use serenity::model::id::GuildId;
 use serenity::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,10 +15,15 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+mod commands;
+
 const MAX_HISTORY_TURNS: usize = 6;
 const MAX_TURN_TEXT_LEN: usize = 700;
-const MAX_CONVERSATION_NAME_LEN: usize = 40;
-const MAX_CONVERSATIONS: usize = 20;
+const MAX_CONTRACT_ID_LEN: usize = 48;
+const MAX_CONTRACT_TITLE_LEN: usize = 80;
+const MAX_CONTRACT_TOPIC_LEN: usize = 80;
+const MAX_CONTRACT_ATTACHMENT_BYTES: usize = 200_000;
+const DISCORD_RESPONSE_CHUNK_LEN: usize = 1900;
 const DEFAULT_CONVERSATION_ID: &str = "principal";
 const DEFAULT_CONVERSATION_NAME: &str = "Principal";
 
@@ -29,6 +31,25 @@ const DEFAULT_CONVERSATION_NAME: &str = "Principal";
 struct ConversationTurn {
     user: String,
     assistant: String,
+}
+
+fn extract_key_points(turns: &[ConversationTurn]) -> Vec<String> {
+    turns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, turn)| {
+            if i % 2 == 0 && !turn.assistant.is_empty() {
+                let summary = if turn.assistant.len() > 100 {
+                    format!("{}...", &turn.assistant[..100])
+                } else {
+                    turn.assistant.clone()
+                };
+                Some(summary)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,6 +71,13 @@ struct PersistedConversationEntry {
     data: UserConversations,
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedContractSessionEntry {
+    channel_id: u64,
+    user_id: u64,
+    data: ContractSession,
+}
+
 impl UserConversations {
     fn new() -> Self {
         let mut conversations = HashMap::new();
@@ -68,16 +96,29 @@ impl UserConversations {
     }
 
     fn ensure_active_exists(&mut self) {
-        if self.conversations.contains_key(&self.active_id) {
-            return;
+        let mut principal_turns = self
+            .conversations
+            .get(&self.active_id)
+            .map(|conversation| conversation.turns.clone())
+            .or_else(|| {
+                self.conversations
+                    .get(DEFAULT_CONVERSATION_ID)
+                    .map(|conversation| conversation.turns.clone())
+            })
+            .unwrap_or_default();
+
+        if principal_turns.len() > MAX_HISTORY_TURNS {
+            let extra = principal_turns.len() - MAX_HISTORY_TURNS;
+            principal_turns.drain(0..extra);
         }
 
         self.active_id = DEFAULT_CONVERSATION_ID.to_string();
+        self.conversations.clear();
         self.conversations
             .entry(self.active_id.clone())
             .or_insert_with(|| StoredConversation {
                 name: DEFAULT_CONVERSATION_NAME.to_string(),
-                turns: Vec::new(),
+                turns: principal_turns,
             });
     }
 }
@@ -85,6 +126,65 @@ impl UserConversations {
 type ConversationKey = (u64, u64);
 type ConversationStore = Arc<Mutex<HashMap<ConversationKey, UserConversations>>>;
 type ContractStore = Arc<Mutex<HashMap<ConversationKey, ContractDraft>>>;
+type ContractCatalogStore = Arc<Mutex<HashMap<String, StoredContract>>>;
+type ContractSessionStore = Arc<Mutex<HashMap<ConversationKey, ContractSession>>>;
+type PendingUploadStore = Arc<Mutex<HashMap<ConversationKey, PendingContractUpload>>>;
+// message_id -> (channel_id, user_id, contract_id, title, topic, content)
+type ContractMessageStore = Arc<Mutex<HashMap<u64, (u64, u64, String, String, String, String)>>>;
+// contract_id -> ContractExecutionSummary
+type ContractExecutionSummaryStore = Arc<Mutex<HashMap<String, ContractExecutionSummary>>>;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct StoredContract {
+    id: String,
+    title: String,
+    topic: String,
+    content: String,
+    created_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+enum SessionState {
+    Active,
+    Paused,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ContractSession {
+    contract_id: String,
+    contract_title: String,
+    contract_topic: String,
+    contract_content: String,
+    status: SessionState,
+    turns: Vec<ConversationTurn>,
+    last_updated_at: u64,
+}
+
+#[derive(Clone)]
+struct PendingContractUpload {
+    id: String,
+    title: String,
+    topic: String,
+    content: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ContractExecutionSummary {
+    contract_id: String,
+    contract_title: String,
+    contract_topic: String,
+    total_turns: usize,
+    execution_started_at: u64,
+    execution_ended_at: u64,
+    execution_duration_seconds: u64,
+    key_points: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedExecutionSummaryEntry {
+    contract_id: String,
+    summary: ContractExecutionSummary,
+}
 
 #[derive(Clone, Debug)]
 enum ContractStep {
@@ -133,327 +233,21 @@ struct Handler {
     conversations: ConversationStore,
     conversations_path: String,
     contracts: ContractStore,
+    contract_catalog: ContractCatalogStore,
+    contract_catalog_path: String,
+    contract_sessions: ContractSessionStore,
+    contract_sessions_path: String,
+    pending_uploads: PendingUploadStore,
+    contract_message_store: ContractMessageStore,
+    contract_summaries: ContractExecutionSummaryStore,
+    contract_summaries_path: String,
     message_content_enabled: bool,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
-        let register_result = if let Some(guild_id) = self.guild_id {
-            GuildId(guild_id)
-                .set_application_commands(&ctx.http, |commands| {
-                    commands
-                        .create_application_command(|command| {
-                            command
-                                .name("status")
-                                .description("Mostra estado da API e do bot")
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("hello")
-                                .description("Imprime hello world!")
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask")
-                                .description("Envia um prompt para a IA generativa")
-                                .create_option(|option| {
-                                    option
-                                        .name("prompt")
-                                        .description("Pergunta para a IA")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_reset")
-                                .description("Limpa o contexto da conversa com a IA")
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_new")
-                                .description("Cria e ativa uma nova conversa")
-                                .create_option(|option| {
-                                    option
-                                        .name("nome")
-                                        .description("Nome da conversa")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_use")
-                                .description("Ativa uma conversa existente")
-                                .create_option(|option| {
-                                    option
-                                        .name("nome")
-                                        .description("Nome da conversa para ativar")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_list")
-                                .description("Lista as conversas e indica a ativa")
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_summary")
-                                .description("Resume uma conversa a qualquer momento")
-                                .create_option(|option| {
-                                    option
-                                        .name("nome")
-                                        .description("Nome da conversa (opcional, usa a ativa por defeito)")
-                                        .kind(CommandOptionType::String)
-                                        .required(false)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_delete")
-                                .description("Apaga uma conversa")
-                                .create_option(|option| {
-                                    option
-                                        .name("nome")
-                                        .description("Nome da conversa para apagar")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_rename")
-                                .description("Renomeia uma conversa")
-                                .create_option(|option| {
-                                    option
-                                        .name("atual")
-                                        .description("Nome atual da conversa")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                                .create_option(|option| {
-                                    option
-                                        .name("novo")
-                                        .description("Novo nome da conversa")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("ask_export")
-                                .description("Exporta resumo da conversa para ficheiro Markdown")
-                                .create_option(|option| {
-                                    option
-                                        .name("nome")
-                                        .description("Nome da conversa (opcional, usa a ativa por defeito)")
-                                        .kind(CommandOptionType::String)
-                                        .required(false)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("parts")
-                                .description("Explica PARTS e gera um contrato para um tema")
-                                .create_option(|option| {
-                                    option
-                                        .name("tema")
-                                        .description("Tema de aprendizagem")
-                                        .kind(CommandOptionType::String)
-                                        .required(true)
-                                })
-                        })
-                        .create_application_command(|command| {
-                            command
-                                .name("createcontract")
-                                .description("Inicia criacao guiada de um contrato PARTS")
-                        })
-                })
-                .await
-                .map(|_| ())
-        } else {
-            let status_result = Command::create_global_application_command(&ctx.http, |command| {
-                command
-                    .name("status")
-                    .description("Mostra estado da API e do bot")
-            })
-            .await;
-
-            let hello_result = Command::create_global_application_command(&ctx.http, |command| {
-                command
-                    .name("hello")
-                    .description("Imprime hello world!")
-            })
-            .await;
-
-            let ask_result = Command::create_global_application_command(&ctx.http, |command| {
-                command
-                    .name("ask")
-                    .description("Envia um prompt para a IA generativa")
-                    .create_option(|option| {
-                        option
-                            .name("prompt")
-                            .description("Pergunta para a IA")
-                            .kind(CommandOptionType::String)
-                            .required(true)
-                    })
-            })
-            .await;
-
-            let ask_reset_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_reset")
-                        .description("Limpa o contexto da conversa com a IA")
-                })
-                .await;
-
-            let ask_new_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_new")
-                        .description("Cria e ativa uma nova conversa")
-                        .create_option(|option| {
-                            option
-                                .name("nome")
-                                .description("Nome da conversa")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .await;
-
-            let ask_use_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_use")
-                        .description("Ativa uma conversa existente")
-                        .create_option(|option| {
-                            option
-                                .name("nome")
-                                .description("Nome da conversa para ativar")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .await;
-
-            let ask_list_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_list")
-                        .description("Lista as conversas e indica a ativa")
-                })
-                .await;
-
-            let ask_summary_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_summary")
-                        .description("Resume uma conversa a qualquer momento")
-                        .create_option(|option| {
-                            option
-                                .name("nome")
-                                .description("Nome da conversa (opcional, usa a ativa por defeito)")
-                                .kind(CommandOptionType::String)
-                                .required(false)
-                        })
-                })
-                .await;
-
-            let ask_delete_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_delete")
-                        .description("Apaga uma conversa")
-                        .create_option(|option| {
-                            option
-                                .name("nome")
-                                .description("Nome da conversa para apagar")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .await;
-
-            let ask_rename_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_rename")
-                        .description("Renomeia uma conversa")
-                        .create_option(|option| {
-                            option
-                                .name("atual")
-                                .description("Nome atual da conversa")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                        .create_option(|option| {
-                            option
-                                .name("novo")
-                                .description("Novo nome da conversa")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .await;
-
-            let ask_export_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("ask_export")
-                        .description("Exporta resumo da conversa para ficheiro Markdown")
-                        .create_option(|option| {
-                            option
-                                .name("nome")
-                                .description("Nome da conversa (opcional, usa a ativa por defeito)")
-                                .kind(CommandOptionType::String)
-                                .required(false)
-                        })
-                })
-                .await;
-
-            let parts_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("parts")
-                        .description("Explica PARTS e gera um contrato para um tema")
-                        .create_option(|option| {
-                            option
-                                .name("tema")
-                                .description("Tema de aprendizagem")
-                                .kind(CommandOptionType::String)
-                                .required(true)
-                        })
-                })
-                .await;
-
-            let create_contract_result =
-                Command::create_global_application_command(&ctx.http, |command| {
-                    command
-                        .name("createcontract")
-                        .description("Inicia criacao guiada de um contrato PARTS")
-                })
-                .await;
-
-            status_result
-                .and(hello_result)
-                .and(ask_result)
-                .and(ask_reset_result)
-                .and(ask_new_result)
-                .and(ask_use_result)
-                .and(ask_list_result)
-                .and(ask_summary_result)
-                .and(ask_delete_result)
-                .and(ask_rename_result)
-                .and(ask_export_result)
-                .and(parts_result)
-                .and(create_contract_result)
-                .map(|_| ())
-        };
+        let register_result = commands::register_commands(&ctx, self.guild_id).await;
 
         if let Err(err) = register_result {
             eprintln!("Falha ao registrar /status: {err}");
@@ -470,119 +264,108 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        let Interaction::ApplicationCommand(command) = interaction else {
+        let Some(command) = commands::as_application_command(interaction) else {
             return;
         };
 
-        if command.data.name == "status" {
-            respond_status(&ctx, &command).await;
-        } else if command.data.name == "hello" {
-            respond_hello(&ctx, &command).await;
-        } else if command.data.name == "ask" {
-            respond_ask(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_reset" {
-            respond_ask_reset(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_new" {
-            respond_ask_new(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_use" {
-            respond_ask_use(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_list" {
-            respond_ask_list(&ctx, &command, &self.conversations).await;
-        } else if command.data.name == "ask_summary" {
-            respond_ask_summary(&ctx, &command, &self.conversations).await;
-        } else if command.data.name == "ask_delete" {
-            respond_ask_delete(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_rename" {
-            respond_ask_rename(
-                &ctx,
-                &command,
-                &self.conversations,
-                &self.conversations_path,
-            )
-            .await;
-        } else if command.data.name == "ask_export" {
-            respond_ask_export(&ctx, &command, &self.conversations).await;
-        } else if command.data.name == "parts" {
-            respond_parts(&ctx, &command).await;
-        } else if command.data.name == "createcontract" {
-            respond_create_contract(
-                &ctx,
-                &command,
-                &self.contracts,
-                self.message_content_enabled,
-            )
-            .await;
-        }
+        commands::dispatch_application_command(self, &ctx, &command).await;
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
-        process_contract_message(&ctx, &msg, &self.contracts).await;
-    }
-}
-
-async fn respond_status(ctx: &Context, command: &ApplicationCommandInteraction) {
-    let content = format!("API: {} | BOT: {}", crate::api::status(), status());
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content(content.clone()))
-        })
+        if process_pending_contract_upload_message(
+            &ctx,
+            &msg,
+            &self.pending_uploads,
+        )
         .await
-    {
-        eprintln!("Falha ao responder /status: {err}");
+        {
+            return;
+        }
+
+        process_contract_message(
+            &ctx,
+            &msg,
+            &self.contracts,
+            &self.contract_catalog,
+            &self.contract_catalog_path,
+            &self.contract_message_store,
+        ).await;
+    }
+
+    async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
+        // Apenas duas acoes finais: guardar (👍) ou cancelar (❌)
+        let emoji = add_reaction.emoji.to_string();
+
+        let store = self.contract_message_store.lock().await;
+        if let Some((channel_id, author_user_id, _contract_id, title, topic, content)) = store.get(&add_reaction.message_id.0).cloned() {
+            drop(store); // Liberar lock antes de fazer chamadas async
+
+            let reacting_user = add_reaction.user_id.unwrap_or_default().0;
+
+            // Guardar: so o autor pode confirmar com 👍
+            if emoji == "👍" {
+                if reacting_user != author_user_id {
+                    return;
+                }
+
+                let new_id = generate_next_numeric_contract_id(&self.contract_catalog).await;
+                let result = upsert_contract(
+                    &self.contract_catalog,
+                    &self.contract_catalog_path,
+                    &new_id,
+                    &title,
+                    &topic,
+                    &content,
+                )
+                .await;
+
+                let ch = serenity::model::prelude::ChannelId(channel_id);
+                let confirmation = format!(
+                    "✅ Contrato guardado com sucesso no catálogo:\n{}\n\n📌 Usa: `/contract_start id:{}` para iniciar uma sessão com este contrato.",
+                    result, new_id
+                );
+                let _ = ch.say(&ctx.http, confirmation).await;
+
+                let mut store = self.contract_message_store.lock().await;
+                store.remove(&add_reaction.message_id.0);
+                return;
+            }
+
+            // Cancelar: so o autor pode cancelar com ❌
+            if emoji == "❌" {
+                if reacting_user != author_user_id {
+                    return;
+                }
+                let ch = serenity::model::prelude::ChannelId(channel_id);
+                let _ = ch.say(&ctx.http, "Operacao cancelada pelo autor.").await;
+                let mut store = self.contract_message_store.lock().await;
+                store.remove(&add_reaction.message_id.0);
+                return;
+            }
+        }
     }
 }
 
-async fn respond_hello(ctx: &Context, command: &ApplicationCommandInteraction) {
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content("hello world!"))
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /hello: {err}");
+async fn generate_next_numeric_contract_id(contract_catalog: &ContractCatalogStore) -> String {
+    let guard = contract_catalog.lock().await;
+    let mut max_id: u64 = 0;
+    for key in guard.keys() {
+        if let Ok(num) = key.parse::<u64>() {
+            if num > max_id { max_id = num; }
+        }
     }
+    (max_id + 1).to_string()
 }
+
+
 
 async fn respond_ask(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
     conversations: &ConversationStore,
     conversations_path: &str,
+    contract_sessions: &ContractSessionStore,
+    contract_sessions_path: &str,
 ) {
     let prompt = get_string_option(command, "prompt").unwrap_or("");
 
@@ -599,9 +382,21 @@ async fn respond_ask(
         return;
     }
 
+    let conversation_key = (command.channel_id.0, command.user.id.0);
+    let active_contract_session = {
+        let guard = contract_sessions.lock().await;
+        guard.get(&conversation_key).cloned()
+    };
+    let contract_session_is_active = matches!(
+        active_contract_session.as_ref().map(|session| &session.status),
+        Some(SessionState::Active)
+    );
+
     if let Err(err) = command
         .create_interaction_response(&ctx.http, |response| {
-            response.kind(InteractionResponseType::DeferredChannelMessageWithSource)
+            response
+                .kind(InteractionResponseType::DeferredChannelMessageWithSource)
+                .interaction_response_data(|message| message.ephemeral(contract_session_is_active))
         })
         .await
     {
@@ -609,8 +404,7 @@ async fn respond_ask(
         return;
     }
 
-    let conversation_key = (command.channel_id.0, command.user.id.0);
-    let (active_id, active_name, history_snapshot) = {
+    let (active_id, history_snapshot) = {
         let mut guard = conversations.lock().await;
         let user_conversations = guard
             .entry(conversation_key)
@@ -627,7 +421,7 @@ async fn respond_ask(
                 turns: Vec::new(),
             });
 
-        (active_id, active.name, active.turns)
+        (active_id, active.turns)
     };
 
     let structured_history: Vec<(String, String)> = history_snapshot
@@ -635,667 +429,786 @@ async fn respond_ask(
         .map(|turn| (turn.user.clone(), turn.assistant.clone()))
         .collect();
 
-    let result_text = match crate::ai::submit_prompt_with_history(prompt, &structured_history).await {
+    let (prompt_to_send, history_to_send, response_header, is_contract_session) =
+        if let Some(session) = active_contract_session {
+            match session.status {
+                SessionState::Active => {
+                    let prompt = format!(
+                        "Sessao ativa com contrato. Cumpre rigorosamente o contrato abaixo.\nResponde de forma incremental, como continuação da conversa. Mostra apenas o que e novo nesta mensagem e nao repitas a introducao, o contrato, os titulos ou o que ja foi explicado antes.\n\nID: {}\nTitulo: {}\nTopico: {}\n\nContrato:\n{}\n\nPedido do utilizador:\n{}",
+                        session.contract_id,
+                        session.contract_title,
+                        session.contract_topic,
+                        session.contract_content,
+                        prompt
+                    );
+                    let session_history = session
+                        .turns
+                        .iter()
+                        .map(|turn| (turn.user.clone(), turn.assistant.clone()))
+                        .collect::<Vec<_>>();
+                    let header = format!(
+                        "[Sessao contrato ativa: {} | {}]",
+                        session.contract_id, session.contract_title
+                    );
+                    (prompt, session_history, header, true)
+                }
+                SessionState::Paused => (prompt.to_string(), structured_history.clone(), String::new(), false),
+            }
+        } else {
+            (prompt.to_string(), structured_history.clone(), String::new(), false)
+        };
+
+    let result_text = match crate::ai::submit_prompt_with_history(&prompt_to_send, &history_to_send).await {
         Ok(answer) => {
-            remember_turn(
-                conversations,
-                conversation_key,
-                &active_id,
-                prompt,
-                &answer,
-                conversations_path,
-            )
-            .await;
-            let body = truncate_for_discord(&answer, 1700);
-            format!("[Conversa ativa: {active_name}]\n\n{body}")
+            if is_contract_session {
+                remember_contract_session_turn(
+                    contract_sessions,
+                    contract_sessions_path,
+                    conversation_key,
+                    prompt,
+                    &answer,
+                )
+                .await;
+            } else {
+                remember_turn(
+                    conversations,
+                    conversation_key,
+                    &active_id,
+                    prompt,
+                    &answer,
+                    conversations_path,
+                )
+                .await;
+            }
+            if response_header.is_empty() {
+                answer.trim().to_string()
+            } else {
+                format!("{}\n\n{}", response_header, answer.trim())
+            }
         }
         Err(err) => format!("Erro ao consultar IA: {err}"),
     };
 
-    if let Err(err) = command
-        .edit_original_interaction_response(&ctx.http, |response| response.content(result_text))
-        .await
-    {
-        eprintln!("Falha ao responder /ask: {err}");
-    }
-}
-
-async fn respond_ask_reset(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
-) {
-    let key = (command.channel_id.0, command.user.id.0);
-    let (active_name, snapshot) = {
-        let mut guard = conversations.lock().await;
-        let active_name = {
-            let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-            user_conversations.ensure_active_exists();
-
-            let active_id = user_conversations.active_id.clone();
-            if let Some(active) = user_conversations.conversations.get_mut(&active_id) {
-                active.turns.clear();
-                active.name.clone()
-            } else {
-                DEFAULT_CONVERSATION_NAME.to_string()
-            }
-        };
-
-        (active_name, guard.clone())
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao persistir conversas em /ask_reset: {err}");
-    }
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| {
-                    message.content(format!(
-                        "Contexto limpo para a conversa ativa: {active_name}."
-                    ))
-                })
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_reset: {err}");
-    }
-}
-
-async fn respond_ask_new(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
-) {
-    let Some(raw_name) = get_string_option(command, "nome") else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Nome em falta. Usa /ask_new nome:<texto>")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    let (conversation_id, display_name) = normalize_conversation_name(raw_name);
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let (creation_result, snapshot) = {
-        let mut guard = conversations.lock().await;
-        let creation_result = {
-            let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-            user_conversations.ensure_active_exists();
-
-            if !user_conversations.conversations.contains_key(&conversation_id)
-                && user_conversations.conversations.len() >= MAX_CONVERSATIONS
-            {
-                Err(format!(
-                    "Limite de conversas atingido ({MAX_CONVERSATIONS}). Remove algumas para criar novas."
-                ))
-            } else {
-                let already_exists = user_conversations
-                    .conversations
-                    .contains_key(&conversation_id);
-                if !already_exists {
-                    user_conversations.conversations.insert(
-                        conversation_id.clone(),
-                        StoredConversation {
-                            name: display_name.clone(),
-                            turns: Vec::new(),
-                        },
-                    );
-                }
-                user_conversations.active_id = conversation_id;
-
-                if already_exists {
-                    Ok(format!(
-                        "A conversa '{display_name}' ja existia e foi ativada."
-                    ))
-                } else {
-                    Ok(format!("Conversa '{display_name}' criada e ativada."))
-                }
-            }
-        };
-
-        (creation_result, guard.clone())
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao persistir conversas em /ask_new: {err}");
-    }
-
-    let content = match creation_result {
-        Ok(text) => text,
-        Err(err) => err,
-    };
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content(content.clone()))
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_new: {err}");
-    }
-}
-
-async fn respond_ask_use(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
-) {
-    let Some(raw_name) = get_string_option(command, "nome") else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Nome em falta. Usa /ask_use nome:<texto>")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    let (conversation_id, _) = normalize_conversation_name(raw_name);
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let (activation_result, snapshot) = {
-        let mut guard = conversations.lock().await;
-        let activation_result = {
-            let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-            user_conversations.ensure_active_exists();
-
-            if let Some(selected) = user_conversations.conversations.get(&conversation_id) {
-                let selected_name = selected.name.clone();
-                user_conversations.active_id = conversation_id;
-                Ok(format!("Conversa ativa alterada para '{selected_name}'."))
-            } else {
-                let available = format_conversation_list(user_conversations);
-                Err(format!(
-                    "Conversa nao encontrada. Conversas disponiveis:\n{available}"
-                ))
-            }
-        };
-
-        (activation_result, guard.clone())
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao persistir conversas em /ask_use: {err}");
-    }
-
-    let content = match activation_result {
-        Ok(text) => text,
-        Err(err) => err,
-    };
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content(truncate_for_discord(&content, 1900)))
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_use: {err}");
-    }
-}
-
-async fn respond_ask_list(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-) {
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let content = {
-        let mut guard = conversations.lock().await;
-        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-        user_conversations.ensure_active_exists();
-
-        let available = format_conversation_list(user_conversations);
-        format!(
-            "Conversas disponiveis:\n{available}\n\nUsa /ask_use para trocar, /ask_summary para resumir, /ask_export para exportar, /ask_rename para renomear e /ask_delete para apagar."
+    if let Err(err) =
+        send_interaction_response_in_chunks(
+            ctx,
+            command,
+            &result_text,
+            DISCORD_RESPONSE_CHUNK_LEN,
+            is_contract_session,
         )
+            .await
+    {
+        eprintln!("Falha ao responder /ask em partes: {err}");
+    }
+}
+
+async fn respond_contract_upload(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_catalog: &ContractCatalogStore,
+    contract_catalog_path: &str,
+    pending_uploads: &PendingUploadStore,
+    message_content_enabled: bool,
+) {
+    let Some(raw_id) = get_string_option(command, "id") else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content("ID em falta. Usa /contract_upload id:<id> titulo:<texto> topico:<texto> conteudo:<texto>")
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
     };
 
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| {
-                    message.content(truncate_for_discord(&content, 1900))
+    let Some(raw_title) = get_string_option(command, "titulo") else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("Titulo em falta. Usa /contract_upload com titulo.").ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    let Some(raw_topic) = get_string_option(command, "topico") else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("Topico em falta. Usa /contract_upload com topico.").ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    let contract_id = normalize_contract_id(raw_id);
+    if contract_id.is_empty() {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content("ID invalido. Usa letras/numeros e separadores simples.")
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    }
+
+    let title: String = raw_title.chars().take(MAX_CONTRACT_TITLE_LEN).collect();
+    let topic: String = raw_topic.chars().take(MAX_CONTRACT_TOPIC_LEN).collect();
+
+    if let Some(raw_content) = get_string_option(command, "conteudo") {
+        let uploaded_content = raw_content.trim().to_string();
+        if uploaded_content.is_empty() {
+            let _ = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response
+                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                        .interaction_response_data(|message| {
+                            message.content("Conteudo vazio. O contrato precisa de texto.").ephemeral(true)
+                        })
                 })
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_list: {err}");
-    }
-}
-
-async fn respond_ask_summary(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-) {
-    let target_name = get_string_option(command, "nome");
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let lookup = {
-        let mut guard = conversations.lock().await;
-        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-        user_conversations.ensure_active_exists();
-
-        let conversation_id = target_name
-            .map(normalize_conversation_name)
-            .map(|(id, _)| id)
-            .unwrap_or_else(|| user_conversations.active_id.clone());
-
-        user_conversations
-            .conversations
-            .get(&conversation_id)
-            .cloned()
-    };
-
-    let Some(conversation) = lookup else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Conversa nao encontrada. Usa /ask_list para ver as disponiveis.")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    if conversation.turns.is_empty() {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content(format!(
-                            "A conversa '{}' ainda nao tem mensagens para resumir.",
-                            conversation.name
-                        ))
-                    })
-            })
-            .await;
-        return;
-    }
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response.kind(InteractionResponseType::DeferredChannelMessageWithSource)
-        })
-        .await
-    {
-        eprintln!("Falha ao deferir /ask_summary: {err}");
-        return;
-    }
-
-    let result_text = match generate_conversation_summary(&conversation).await {
-        Ok(summary) => {
-            let body = truncate_for_discord(summary.trim(), 1700);
-            format!("Resumo da conversa '{}':\n\n{body}", conversation.name)
+                .await;
+            return;
         }
-        Err(err) => format!("Erro ao resumir conversa: {err}"),
-    };
 
-    if let Err(err) = command
-        .edit_original_interaction_response(&ctx.http, |response| response.content(result_text))
-        .await
-    {
-        eprintln!("Falha ao responder /ask_summary: {err}");
-    }
-}
+        let _content = upsert_contract(
+            contract_catalog,
+            contract_catalog_path,
+            &contract_id,
+            &title,
+            &topic,
+            &uploaded_content,
+        )
+        .await;
 
-async fn respond_ask_delete(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
-) {
-    let Some(raw_name) = get_string_option(command, "nome") else {
         let _ = command
             .create_interaction_response(&ctx.http, |response| {
                 response
                     .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Nome em falta. Usa /ask_delete nome:<texto>")
-                    })
+                    .interaction_response_data(|message| message.ephemeral(true))
             })
             .await;
-        return;
-    };
-
-    let (conversation_id, _) = normalize_conversation_name(raw_name);
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let (deletion_result, snapshot) = {
-        let mut guard = conversations.lock().await;
-        let deletion_result = {
-            let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-            user_conversations.ensure_active_exists();
-
-            if !user_conversations.conversations.contains_key(&conversation_id) {
-                let available = format_conversation_list(user_conversations);
-                Err(format!(
-                    "Conversa nao encontrada. Conversas disponiveis:\n{available}"
-                ))
-            } else if user_conversations.conversations.len() == 1 {
-                if let Some(only) = user_conversations
-                    .conversations
-                    .get_mut(&user_conversations.active_id)
-                {
-                    only.turns.clear();
-                }
-                Ok("Nao e possivel apagar a unica conversa. O historico foi limpo.".to_string())
-            } else {
-                let removed_name = user_conversations
-                    .conversations
-                    .remove(&conversation_id)
-                    .map(|conversation| conversation.name)
-                    .unwrap_or_else(|| "(desconhecida)".to_string());
-
-                if user_conversations.active_id == conversation_id {
-                    if user_conversations
-                        .conversations
-                        .contains_key(DEFAULT_CONVERSATION_ID)
-                    {
-                        user_conversations.active_id = DEFAULT_CONVERSATION_ID.to_string();
-                    } else if let Some(first_id) = user_conversations.conversations.keys().next() {
-                        user_conversations.active_id = first_id.clone();
-                    }
-                }
-
-                let active_name = user_conversations
-                    .conversations
-                    .get(&user_conversations.active_id)
-                    .map(|conversation| conversation.name.clone())
-                    .unwrap_or_else(|| DEFAULT_CONVERSATION_NAME.to_string());
-
-                Ok(format!(
-                    "Conversa '{removed_name}' apagada. Conversa ativa: '{active_name}'."
-                ))
-            }
-        };
-
-        (deletion_result, guard.clone())
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao persistir conversas em /ask_delete: {err}");
-    }
-
-    let content = match deletion_result {
-        Ok(text) => text,
-        Err(err) => err,
-    };
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| {
-                    message.content(truncate_for_discord(&content, 1900))
-                })
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_delete: {err}");
-    }
-}
-
-async fn respond_ask_rename(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
-) {
-    let Some(current_name_raw) = get_string_option(command, "atual") else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Nome atual em falta. Usa /ask_rename atual:<nome> novo:<nome>")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    let Some(new_name_raw) = get_string_option(command, "novo") else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Novo nome em falta. Usa /ask_rename atual:<nome> novo:<nome>")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    let (current_id, _) = normalize_conversation_name(current_name_raw);
-    let (new_id, new_display_name) = normalize_conversation_name(new_name_raw);
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let (rename_result, snapshot) = {
-        let mut guard = conversations.lock().await;
-        let rename_result = {
-            let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-            user_conversations.ensure_active_exists();
-
-            if !user_conversations.conversations.contains_key(&current_id) {
-                let available = format_conversation_list(user_conversations);
-                Err(format!(
-                    "Conversa nao encontrada. Conversas disponiveis:\n{available}"
-                ))
-            } else if current_id != new_id
-                && user_conversations.conversations.contains_key(&new_id)
-            {
-                Err("Ja existe uma conversa com esse novo nome.".to_string())
-            } else {
-                let mut conversation = user_conversations
-                    .conversations
-                    .remove(&current_id)
-                    .unwrap_or(StoredConversation {
-                        name: new_display_name.clone(),
-                        turns: Vec::new(),
-                    });
-                conversation.name = new_display_name.clone();
-                user_conversations
-                    .conversations
-                    .insert(new_id.clone(), conversation);
-
-                if user_conversations.active_id == current_id {
-                    user_conversations.active_id = new_id;
-                }
-
-                Ok(format!("Conversa renomeada para '{new_display_name}'."))
-            }
-        };
-
-        (rename_result, guard.clone())
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao persistir conversas em /ask_rename: {err}");
-    }
-
-    let content = match rename_result {
-        Ok(text) => text,
-        Err(err) => err,
-    };
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| {
-                    message.content(truncate_for_discord(&content, 1900))
-                })
-        })
-        .await
-    {
-        eprintln!("Falha ao responder /ask_rename: {err}");
-    }
-}
-
-async fn respond_ask_export(
-    ctx: &Context,
-    command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-) {
-    let target_name = get_string_option(command, "nome");
-    let key = (command.channel_id.0, command.user.id.0);
-
-    let lookup = {
-        let mut guard = conversations.lock().await;
-        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-        user_conversations.ensure_active_exists();
-
-        let conversation_id = target_name
-            .map(normalize_conversation_name)
-            .map(|(id, _)| id)
-            .unwrap_or_else(|| user_conversations.active_id.clone());
-
-        user_conversations
-            .conversations
-            .get(&conversation_id)
-            .cloned()
-    };
-
-    let Some(conversation) = lookup else {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content("Conversa nao encontrada. Usa /ask_list para ver as disponiveis.")
-                    })
-            })
-            .await;
-        return;
-    };
-
-    if conversation.turns.is_empty() {
-        let _ = command
-            .create_interaction_response(&ctx.http, |response| {
-                response
-                    .kind(InteractionResponseType::ChannelMessageWithSource)
-                    .interaction_response_data(|message| {
-                        message.content(format!(
-                            "A conversa '{}' ainda nao tem mensagens para exportar.",
-                            conversation.name
-                        ))
-                    })
-            })
-            .await;
-        return;
-    }
-
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response.kind(InteractionResponseType::DeferredChannelMessageWithSource)
-        })
-        .await
-    {
-        eprintln!("Falha ao deferir /ask_export: {err}");
-        return;
-    }
-
-    let result_text = match generate_conversation_summary(&conversation).await {
-        Ok(summary) => {
-            let export_dir = env::var("CONVERSATION_EXPORT_DIR")
-                .unwrap_or_else(|_| "data/exports".to_string());
-            let timestamp = current_unix_timestamp();
-            let filename = format!(
-                "{}_{}.md",
-                sanitize_for_filename(&conversation.name),
-                timestamp
-            );
-            let path = Path::new(&export_dir).join(filename);
-
-            let write_result = fs::create_dir_all(&export_dir)
-                .map_err(|err| format!("Erro a criar diretorio de exportacao: {err}"))
-                .and_then(|_| {
-                    let markdown = format!(
-                        "# Resumo da Conversa\n\nNome: {}\nGerado em: {}\n\n## Resumo\n\n{}\n",
-                        conversation.name,
-                        timestamp,
-                        summary.trim()
-                    );
-                    fs::write(&path, markdown)
-                        .map_err(|err| format!("Erro a gravar ficheiro de exportacao: {err}"))
-                });
-
-            match write_result {
-                Ok(()) => format!(
-                    "Resumo exportado com sucesso para: {}",
-                    path.display()
-                ),
-                Err(err) => format!("Falha ao exportar resumo: {err}"),
-            }
-        }
-        Err(err) => format!("Erro ao gerar resumo para exportacao: {err}"),
-    };
-
-    if let Err(err) = command
-        .edit_original_interaction_response(&ctx.http, |response| response.content(result_text))
-        .await
-    {
-        eprintln!("Falha ao responder /ask_export: {err}");
-    }
-}
-
-fn current_unix_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
-fn sanitize_for_filename(raw: &str) -> String {
-    let mut value = String::new();
-    let mut previous_was_separator = false;
-    for character in raw.chars() {
-        let normalized = character.to_ascii_lowercase();
-        if normalized.is_ascii_alphanumeric() {
-            value.push(normalized);
-            previous_was_separator = false;
-        } else if !previous_was_separator {
-            value.push('_');
-            previous_was_separator = true;
-        }
-    }
-
-    let value = value.trim_matches('_').to_string();
-    if value.is_empty() {
-        "conversa".to_string()
     } else {
-        value
+        if !message_content_enabled {
+            let _ = command
+                .create_interaction_response(&ctx.http, |response| {
+                    response
+                        .kind(InteractionResponseType::ChannelMessageWithSource)
+                        .interaction_response_data(|message| {
+                            message
+                                .content("Sem conteudo no slash command. Ativa DISCORD_ENABLE_MESSAGE_CONTENT=1 para enviar o contrato na mensagem seguinte, ou passa conteudo diretamente no comando.")
+                                .ephemeral(true)
+                        })
+                })
+                .await;
+            return;
+        }
+
+        let key = (command.channel_id.0, command.user.id.0);
+        {
+            let mut guard = pending_uploads.lock().await;
+            guard.insert(
+                key,
+                PendingContractUpload {
+                    id: contract_id.clone(),
+                    title: title.clone(),
+                    topic: topic.clone(),
+                    content: String::new(),
+                },
+            );
+        }
+
+        let content = format!(
+            "Modo upload iniciado para contrato ID '{}' ({}).\nPodes enviar o conteudo em varias mensagens.\nQuando terminares, usa /contract_upload_finish para gravar.\nPara cancelar usa /contract_upload_cancel.",
+            contract_id, title
+        );
+
+        if let Err(err) = create_interaction_response_in_chunks(
+            ctx,
+            command,
+            &content,
+            DISCORD_RESPONSE_CHUNK_LEN,
+            true,
+        )
+            .await
+        {
+            eprintln!("Falha ao responder /contract_upload: {err}");
+        }
     }
 }
 
-async fn generate_conversation_summary(conversation: &StoredConversation) -> Result<String, crate::ai::AiError> {
-    let transcript = conversation
+async fn respond_contract_upload_cancel(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    pending_uploads: &PendingUploadStore,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+    let content = {
+        let mut guard = pending_uploads.lock().await;
+        if guard.remove(&key).is_some() {
+            "Upload pendente cancelado com sucesso.".to_string()
+        } else {
+            "Nao existe upload pendente para cancelar neste canal/utilizador.".to_string()
+        }
+    };
+
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true)
+            .await
+    {
+        eprintln!("Falha ao responder /contract_upload_cancel: {err}");
+    }
+}
+
+async fn respond_contract_upload_finish(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    pending_uploads: &PendingUploadStore,
+    contract_catalog: &ContractCatalogStore,
+    contract_catalog_path: &str,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+    let pending = {
+        let mut guard = pending_uploads.lock().await;
+        guard.remove(&key)
+    };
+
+    let Some(pending) = pending else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content("Nao existe upload pendente neste canal/utilizador.")
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    if pending.content.trim().is_empty() {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content("O upload pendente nao tem conteudo. Envia texto e depois usa /contract_upload_finish.")
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    }
+
+    let _result = upsert_contract(
+        contract_catalog,
+        contract_catalog_path,
+        &pending.id,
+        &pending.title,
+        &pending.topic,
+        pending.content.trim(),
+    )
+    .await;
+
+    let _ = command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| message.ephemeral(true))
+        })
+        .await;
+}
+
+async fn process_pending_contract_upload_message(
+    ctx: &Context,
+    msg: &Message,
+    pending_uploads: &PendingUploadStore,
+) -> bool {
+    if msg.author.bot {
+        return false;
+    }
+
+    let key = (msg.channel_id.0, msg.author.id.0);
+    let has_pending = {
+        let guard = pending_uploads.lock().await;
+        guard.contains_key(&key)
+    };
+
+    if !has_pending {
+        return false;
+    }
+
+    let content = if !msg.content.trim().is_empty() {
+        msg.content.trim().to_string()
+    } else {
+        match extract_contract_content_from_attachments(msg).await {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                send_private_pending_upload_feedback(
+                    ctx,
+                    msg,
+                    "Conteudo vazio. Cola o contrato completo numa mensagem normal ou anexa um ficheiro .txt/.md/.markdown/.json. Para cancelar: /contract_upload_cancel.",
+                )
+                .await;
+                return true;
+            }
+            Err(err) => {
+                send_private_pending_upload_feedback(
+                    ctx,
+                    msg,
+                    &format!("Falha ao ler anexo: {err}. Tenta novamente ou usa /contract_upload_cancel."),
+                )
+                .await;
+                return true;
+            }
+        }
+    };
+
+    let buffered_len = {
+        let mut guard = pending_uploads.lock().await;
+        if let Some(current) = guard.get_mut(&key) {
+            if !current.content.is_empty() {
+                current.content.push('\n');
+            }
+            current.content.push_str(&content);
+            current.content.len()
+        } else {
+            0
+        }
+    };
+
+    let feedback = format!(
+        "Parte recebida e adicionada ao upload pendente ({} caracteres acumulados). Quando terminares, usa /contract_upload_finish. Para cancelar: /contract_upload_cancel.",
+        buffered_len
+    );
+    send_private_pending_upload_feedback(ctx, msg, &feedback).await;
+    true
+}
+
+async fn respond_contract_remove(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_catalog: &ContractCatalogStore,
+    contract_catalog_path: &str,
+    contract_sessions: &ContractSessionStore,
+    contract_sessions_path: &str,
+) {
+    let Some(raw_contract_id) = get_string_option(command, "id") else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("ID em falta. Usa /contract_remove id:<id>").ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    let contract_id = normalize_contract_id(raw_contract_id);
+    if contract_id.is_empty() {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("ID invalido.").ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    }
+
+    let (removed, snapshot) = {
+        let mut guard = contract_catalog.lock().await;
+        let removed = guard.remove(&contract_id).is_some();
+        (removed, guard.clone())
+    };
+
+    if !removed {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content(format!("Contrato '{}' nao encontrado.", contract_id))
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    }
+
+    if let Err(err) = save_contracts_to_disk(contract_catalog_path, &snapshot) {
+        eprintln!("Falha ao persistir remocao de contrato: {err}");
+    }
+
+    {
+        let mut guard = contract_sessions.lock().await;
+        guard.retain(|_, session| session.contract_id != contract_id);
+    }
+
+    persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+    let content = format!(
+        "Contrato '{}' removido com sucesso. Sessoes associadas foram encerradas.",
+        contract_id
+    );
+
+    if let Err(err) = create_interaction_response_in_chunks(
+        ctx,
+        command,
+        &content,
+        DISCORD_RESPONSE_CHUNK_LEN,
+        true,
+    )
+    .await
+    {
+        eprintln!("Falha ao responder /contract_remove: {err}");
+    }
+}
+
+async fn send_private_pending_upload_feedback(ctx: &Context, msg: &Message, content: &str) {
+    let dm_result = msg
+        .author
+        .direct_message(&ctx.http, |message| message.content(content))
+        .await;
+
+    if dm_result.is_err() {
+        let _ = msg.channel_id.say(
+            &ctx.http,
+            "Nao consegui enviar DM (privado). Ativa DMs do servidor para receber feedback privado.",
+        ).await;
+    }
+}
+
+async fn extract_contract_content_from_attachments(
+    msg: &Message,
+) -> Result<Option<String>, String> {
+    let Some(attachment) = msg.attachments.first() else {
+        return Ok(None);
+    };
+
+    let filename = attachment.filename.to_ascii_lowercase();
+    let allowed = filename.ends_with(".txt")
+        || filename.ends_with(".md")
+        || filename.ends_with(".markdown")
+        || filename.ends_with(".json");
+
+    if !allowed {
+        return Err("tipo de ficheiro nao suportado (usa .txt, .md, .markdown ou .json)".to_string());
+    }
+
+    let bytes = attachment
+        .download()
+        .await
+        .map_err(|err| format!("erro ao descarregar anexo: {err}"))?;
+
+    if bytes.len() > MAX_CONTRACT_ATTACHMENT_BYTES {
+        return Err(format!(
+            "ficheiro muito grande (maximo: {} bytes)",
+            MAX_CONTRACT_ATTACHMENT_BYTES
+        ));
+    }
+
+    let text = String::from_utf8(bytes)
+        .map_err(|_| "anexo nao esta em UTF-8 valido".to_string())?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(trimmed.to_string()))
+}
+
+async fn upsert_contract(
+    contract_catalog: &ContractCatalogStore,
+    contract_catalog_path: &str,
+    contract_id: &str,
+    title: &str,
+    topic: &str,
+    content: &str,
+) -> String {
+    let (was_update, snapshot) = {
+        let mut guard = contract_catalog.lock().await;
+        let was_update = guard.contains_key(contract_id);
+        guard.insert(
+            contract_id.to_string(),
+            StoredContract {
+                id: contract_id.to_string(),
+                title: title.to_string(),
+                topic: topic.to_string(),
+                content: content.to_string(),
+                created_at: current_unix_timestamp(),
+            },
+        );
+        (was_update, guard.clone())
+    };
+
+    if let Err(err) = save_contracts_to_disk(contract_catalog_path, &snapshot) {
+        eprintln!("Falha ao persistir catalogo de contratos: {err}");
+    }
+
+    if was_update {
+        format!(
+            "Contrato atualizado com sucesso. ID: {} | Titulo: {} | Topico: {}",
+            contract_id, title, topic
+        )
+    } else {
+        format!(
+            "Contrato criado com sucesso. ID: {} | Titulo: {} | Topico: {}",
+            contract_id, title, topic
+        )
+    }
+}
+
+async fn respond_contract_list(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_catalog: &ContractCatalogStore,
+) {
+    let content = {
+        let guard = contract_catalog.lock().await;
+        if guard.is_empty() {
+            "Sem contratos registados. Usa /contract_upload para criar o primeiro.".to_string()
+        } else {
+            let mut contracts: Vec<&StoredContract> = guard.values().collect();
+            contracts.sort_by(|a, b| a.title.to_ascii_lowercase().cmp(&b.title.to_ascii_lowercase()));
+
+            let rows = contracts
+                .into_iter()
+                .map(|contract| {
+                    format!(
+                        "- ID: {} | Titulo: {} | Topico: {}",
+                        contract.id, contract.title, contract.topic
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            format!(
+                "Contratos disponiveis:\n{rows}\n\nUsa /contract_start id:<id> para iniciar uma sessao."
+            )
+        }
+    };
+
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true)
+            .await
+    {
+        eprintln!("Falha ao responder /contract_list: {err}");
+    }
+}
+
+async fn respond_contract_start(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_catalog: &ContractCatalogStore,
+    contract_sessions: &ContractSessionStore,
+    contract_sessions_path: &str,
+) {
+    let Some(raw_contract_id) = get_string_option(command, "id") else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("ID em falta. Usa /contract_start id:<id>").ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    let contract_id = normalize_contract_id(raw_contract_id);
+    let contract = {
+        let guard = contract_catalog.lock().await;
+        guard.get(&contract_id).cloned()
+    };
+
+    let Some(contract) = contract else {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message
+                            .content("Contrato nao encontrado. Usa /contract_list para ver IDs validos.")
+                            .ephemeral(true)
+                    })
+            })
+            .await;
+        return;
+    };
+
+    let key = (command.channel_id.0, command.user.id.0);
+    let now = current_unix_timestamp();
+    let existing_session = {
+        let guard = contract_sessions.lock().await;
+        guard.get(&key).cloned()
+    };
+
+    if let Some(session) = existing_session {
+        match session.status {
+            SessionState::Active if session.contract_id == contract.id => {
+                let summary_text = summarize_contract_session(&session).await;
+                let content = format!(
+                    "Ja tens uma sessao ativa para este contrato '{}' (ID: {}).\n\nResumo breve da sessao atual:\n{}\n\nSe quiseres continuar, usa /ask neste canal. Se quiseres guardar o estado para mais tarde, usa /contract_pause.",
+                    contract.title, contract.id, summary_text
+                );
+
+                if let Err(err) = create_interaction_response_in_chunks(
+                    ctx,
+                    command,
+                    &content,
+                    DISCORD_RESPONSE_CHUNK_LEN,
+                    true,
+                )
+                .await
+                {
+                    eprintln!("Falha ao responder /contract_start: {err}");
+                }
+
+                return;
+            }
+            SessionState::Active => {
+                let content = format!(
+                    "Ja tens uma sessao ativa para outro contrato: '{}' (ID: {}).\nNao vou criar outra sessão por cima.\nSe queres mudar de contexto, primeiro pausa essa sessão e depois usa /contract_restore id:<id> ou /contract_start id:<id>.",
+                    session.contract_title, session.contract_id
+                );
+
+                if let Err(err) = create_interaction_response_in_chunks(
+                    ctx,
+                    command,
+                    &content,
+                    DISCORD_RESPONSE_CHUNK_LEN,
+                    true,
+                )
+                .await
+                {
+                    eprintln!("Falha ao responder /contract_start: {err}");
+                }
+
+                return;
+            }
+            SessionState::Paused if session.contract_id == contract.id => {
+                let content = {
+                    let mut guard = contract_sessions.lock().await;
+                    if let Some(current) = guard.get_mut(&key) {
+                        current.status = SessionState::Active;
+                        current.last_updated_at = now;
+                    }
+
+                    format!(
+                        "Sessao pausada restaurada para o contrato '{}' (ID: {}).\nA sessão anterior continua guardada e podes retomar com /ask.",
+                        contract.title, contract.id
+                    )
+                };
+
+                persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+                if let Err(err) = create_interaction_response_in_chunks(
+                    ctx,
+                    command,
+                    &content,
+                    DISCORD_RESPONSE_CHUNK_LEN,
+                    true,
+                )
+                .await
+                {
+                    eprintln!("Falha ao responder /contract_start: {err}");
+                }
+
+                return;
+            }
+            SessionState::Paused => {
+                let content = format!(
+                    "Já tens uma sessão pausada para o contrato '{}' (ID: {}).\nPara não perder contexto, usa /contract_restore id:{} para voltar a essa sessão.",
+                    session.contract_title, session.contract_id, session.contract_id
+                );
+
+                if let Err(err) = create_interaction_response_in_chunks(
+                    ctx,
+                    command,
+                    &content,
+                    DISCORD_RESPONSE_CHUNK_LEN,
+                    true,
+                )
+                .await
+                {
+                    eprintln!("Falha ao responder /contract_start: {err}");
+                }
+
+                return;
+            }
+        }
+    }
+
+    {
+        let mut guard = contract_sessions.lock().await;
+        guard.insert(
+            key,
+            ContractSession {
+                contract_id: contract.id.clone(),
+                contract_title: contract.title.clone(),
+                contract_topic: contract.topic.clone(),
+                contract_content: contract.content.clone(),
+                status: SessionState::Active,
+                turns: Vec::new(),
+                last_updated_at: now,
+            },
+        );
+    }
+
+    persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+    let content = format!(
+        "Sessao iniciada para o contrato '{}' (ID: {}).\nAs mensagens de /ask deste utilizador+canal passam a seguir este contrato.\nUsa /contract_pause para pausar.",
+        contract.title, contract.id
+    );
+
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true)
+            .await
+    {
+        eprintln!("Falha ao responder /contract_start: {err}");
+    }
+}
+
+async fn summarize_contract_session(session: &ContractSession) -> String {
+    let status_label = match session.status {
+        SessionState::Active => "ativa",
+        SessionState::Paused => "pausada",
+    };
+
+    if session.turns.is_empty() {
+        return format!(
+            "Sessao sem interacoes ainda.\nContrato: '{}' (ID: {}, topico: {}).\nEstado: {}.",
+            session.contract_title, session.contract_id, session.contract_topic, status_label
+        );
+    }
+
+    let transcript = session
         .turns
         .iter()
         .enumerate()
@@ -1310,17 +1223,550 @@ async fn generate_conversation_summary(conversation: &StoredConversation) -> Res
         .join("\n\n");
 
     let prompt = format!(
-        "Resume em portugues a seguinte interacao entre estudante e assistente. \
-Seja objetivo e util para retomar a conversa mais tarde.\n\
+        "Resume em portugues a sessao de contrato abaixo para retomar mais tarde.\n\
 Formato obrigatorio:\n\
-1) Resumo curto\n\
-2) Pontos principais aprendidos\n\
-3) Duvidas em aberto\n\
+1) Estado atual da sessao\n\
+2) O que ja foi feito\n\
+3) O que falta fazer\n\
 4) Proximo passo recomendado\n\n\
-Interacao:\n{transcript}"
+Metadados:\nContrato: {} (ID: {}, topico: {})\nEstado: {}\n\nInteracao:\n{}",
+        session.contract_title,
+        session.contract_id,
+        session.contract_topic,
+        status_label,
+        transcript
     );
 
-    crate::ai::submit_prompt(&prompt).await
+    match crate::ai::submit_prompt(&prompt).await {
+        Ok(text) => text.trim().to_string(),
+        Err(err) => format!("Falha ao gerar resumo com IA: {err}"),
+    }
+}
+
+async fn respond_contract_pause(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_sessions: &ContractSessionStore,
+    contract_sessions_path: &str,
+    contract_summaries: &ContractExecutionSummaryStore,
+    contract_summaries_path: &str,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+    let (session_data, content) = {
+        let mut guard = contract_sessions.lock().await;
+        if let Some(session) = guard.get_mut(&key) {
+            match session.status {
+                SessionState::Paused => (None, "A sessao ja esta pausada.".to_string()),
+                SessionState::Active => {
+                    let session_clone = session.clone();
+                    session.status = SessionState::Paused;
+                    session.last_updated_at = current_unix_timestamp();
+                    let msg = format!(
+                        "Sessao pausada. Contrato: '{}' (ID: {}). Usa /contract_restore para retomar.",
+                        session.contract_title, session.contract_id
+                    );
+                    (Some(session_clone), msg)
+                }
+            }
+        } else {
+            (None, "Nao existe sessao ativa para este utilizador/canal. Usa /contract_start primeiro."
+                .to_string())
+        }
+    };
+
+    // Gerar resumo se houve uma sessão ativa
+    if let Some(session) = session_data {
+        let summary = ContractExecutionSummary {
+            contract_id: session.contract_id.clone(),
+            contract_title: session.contract_title.clone(),
+            contract_topic: session.contract_topic.clone(),
+            total_turns: session.turns.len(),
+            execution_started_at: session.last_updated_at - (session.turns.len() as u64 * 60), // Estimativa
+            execution_ended_at: current_unix_timestamp(),
+            execution_duration_seconds: (session.last_updated_at as u64).saturating_sub(session.last_updated_at as u64 - (session.turns.len() as u64 * 60)),
+            key_points: extract_key_points(&session.turns),
+        };
+
+        {
+            let mut summaries = contract_summaries.lock().await;
+            summaries.insert(session.contract_id.clone(), summary);
+        }
+
+        persist_execution_summaries(contract_summaries, contract_summaries_path).await;
+    }
+
+    persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true)
+            .await
+    {
+        eprintln!("Falha ao responder /contract_pause: {err}");
+    }
+}
+
+async fn respond_contract_restore(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_sessions: &ContractSessionStore,
+    contract_catalog: &ContractCatalogStore,
+    contract_sessions_path: &str,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+    let requested_contract_id = get_string_option(command, "id").map(normalize_contract_id);
+
+    if let Some(contract_id) = requested_contract_id {
+        if contract_id.is_empty() {
+            let content = "ID invalido. Usa um ID valido em /contract_restore id:<id>.".to_string();
+            let _ = create_interaction_response_in_chunks(
+                ctx,
+                command,
+                &content,
+                DISCORD_RESPONSE_CHUNK_LEN,
+                true,
+            )
+            .await;
+            return;
+        }
+
+        let selected_contract = {
+            let guard = contract_catalog.lock().await;
+            guard.get(&contract_id).cloned()
+        };
+
+        let Some(contract) = selected_contract else {
+            let content =
+                "Contrato nao encontrado para esse ID. Usa /contract_list para ver os IDs.".to_string();
+            let _ = create_interaction_response_in_chunks(
+                ctx,
+                command,
+                &content,
+                DISCORD_RESPONSE_CHUNK_LEN,
+                true,
+            )
+            .await;
+            return;
+        };
+
+        let existing_session = {
+            let guard = contract_sessions.lock().await;
+            guard.get(&key).cloned()
+        };
+
+        let content = if let Some(session) = existing_session {
+            if session.status == SessionState::Active && session.contract_id == contract.id {
+                let summary_text = summarize_contract_session(&session).await;
+                format!(
+                    "Ja tens esta sessao ativa para '{}' (ID: {}).\n\nResumo breve da sessao atual:\n{}\n\nSe quiseres continuar, usa /ask neste canal. Se quiseres pausar, usa /contract_pause.",
+                    contract.title, contract.id, summary_text
+                )
+            } else if session.status == SessionState::Active {
+                format!(
+                    "Ja tens uma sessao ativa para o contrato '{}' (ID: {}).\nNao vou restaurar outro contrato por cima.\nSe queres mudar de contexto, primeiro usa /contract_pause nessa sessão.",
+                    session.contract_title, session.contract_id
+                )
+            } else if session.contract_id == contract.id {
+                {
+                    let mut guard = contract_sessions.lock().await;
+                    if let Some(current) = guard.get_mut(&key) {
+                        current.status = SessionState::Active;
+                        current.last_updated_at = current_unix_timestamp();
+                    }
+
+                    format!(
+                        "Sessao restaurada para '{}' (ID: {}).\nPodes continuar com /ask neste canal.",
+                        contract.title, contract.id
+                    )
+                }
+            } else {
+                {
+                    let mut guard = contract_sessions.lock().await;
+                    if let Some(current) = guard.get_mut(&key) {
+                        current.contract_id = contract.id.clone();
+                        current.contract_title = contract.title.clone();
+                        current.contract_topic = contract.topic.clone();
+                        current.contract_content = contract.content.clone();
+                        current.status = SessionState::Active;
+                        current.turns.clear();
+                        current.last_updated_at = current_unix_timestamp();
+                    }
+
+                    format!(
+                        "Sessao associada e restaurada para contrato '{}' (ID: {}).\nPodes continuar com /ask neste canal.",
+                        contract.title, contract.id
+                    )
+                }
+            }
+        } else {
+            {
+                let mut guard = contract_sessions.lock().await;
+                guard.insert(
+                    key,
+                    ContractSession {
+                        contract_id: contract.id.clone(),
+                        contract_title: contract.title.clone(),
+                        contract_topic: contract.topic.clone(),
+                        contract_content: contract.content.clone(),
+                        status: SessionState::Active,
+                        turns: Vec::new(),
+                        last_updated_at: current_unix_timestamp(),
+                    },
+                );
+                format!(
+                    "Nao havia sessao neste canal/utilizador. Sessao iniciada para '{}' (ID: {}).\nPodes continuar com /ask neste canal.",
+                    contract.title, contract.id
+                )
+            }
+        };
+
+        persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+        if let Err(err) = create_interaction_response_in_chunks(
+            ctx,
+            command,
+            &content,
+            DISCORD_RESPONSE_CHUNK_LEN,
+            true,
+        )
+        .await
+        {
+            eprintln!("Falha ao responder /contract_restore: {err}");
+        }
+        return;
+    }
+
+    let content = {
+        let mut guard = contract_sessions.lock().await;
+        if let Some(session) = guard.get_mut(&key) {
+            match session.status {
+                SessionState::Active => format!(
+                    "A sessao ja esta ativa. Contrato: '{}' (ID: {}).\nPodes continuar com /ask neste canal.",
+                    session.contract_title, session.contract_id
+                ),
+                SessionState::Paused => {
+                    session.status = SessionState::Active;
+                    session.last_updated_at = current_unix_timestamp();
+                    format!(
+                        "Sessao restaurada. Contrato ativo: '{}' (ID: {}).\nPodes continuar com /ask neste canal.",
+                        session.contract_title, session.contract_id
+                    )
+                }
+            }
+        } else {
+            "Nao existe sessao para restaurar neste utilizador/canal. Usa /contract_start primeiro."
+                .to_string()
+        }
+    };
+
+    persist_contract_sessions(contract_sessions, contract_sessions_path).await;
+
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true)
+            .await
+    {
+        eprintln!("Falha ao responder /contract_restore: {err}");
+    }
+}
+
+async fn respond_contract_session_summary(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_sessions: &ContractSessionStore,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+    let session = {
+        let guard = contract_sessions.lock().await;
+        guard.get(&key).cloned()
+    };
+
+    let Some(session) = session else {
+        let content = "Nao existe sessao de contrato para resumir neste canal/utilizador.".to_string();
+        let _ = create_interaction_response_in_chunks(
+            ctx,
+            command,
+            &content,
+            DISCORD_RESPONSE_CHUNK_LEN,
+            true,
+        )
+        .await;
+        return;
+    };
+
+    if let Err(err) = command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::DeferredChannelMessageWithSource)
+                .interaction_response_data(|message| message.ephemeral(true))
+        })
+        .await
+    {
+        eprintln!("Falha ao deferir /contract_session_summary: {err}");
+        return;
+    }
+
+    let status_label = match session.status {
+        SessionState::Active => "ativa",
+        SessionState::Paused => "pausada",
+    };
+
+    let summary_text = if session.turns.is_empty() {
+        format!(
+            "Sessao sem interacoes ainda.\nContrato: '{}' (ID: {}, topico: {}).\nEstado: {}.",
+            session.contract_title, session.contract_id, session.contract_topic, status_label
+        )
+    } else {
+        let transcript = session
+            .turns
+            .iter()
+            .enumerate()
+            .map(|(idx, turn)| {
+                let turn_number = idx + 1;
+                format!(
+                    "Turno {turn_number}\nUtilizador: {}\nAssistente: {}",
+                    turn.user, turn.assistant
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let prompt = format!(
+            "Resume em portugues a sessao de contrato abaixo para retomar mais tarde.\n\
+Formato obrigatorio:\n\
+1) Estado atual da sessao\n\
+2) O que ja foi feito\n\
+3) O que falta fazer\n\
+4) Proximo passo recomendado\n\n\
+Metadados:\nContrato: {} (ID: {}, topico: {})\nEstado: {}\n\nInteracao:\n{}",
+            session.contract_title,
+            session.contract_id,
+            session.contract_topic,
+            status_label,
+            transcript
+        );
+
+        match crate::ai::submit_prompt(&prompt).await {
+            Ok(text) => text.trim().to_string(),
+            Err(err) => format!("Falha ao gerar resumo com IA: {err}"),
+        }
+    };
+
+    let final_content = format!(
+        "Resumo da sessao de contrato '{}' (ID: {}):\n\n{}",
+        session.contract_title, session.contract_id, summary_text
+    );
+
+    if let Err(err) = send_interaction_response_in_chunks(
+        ctx,
+        command,
+        &final_content,
+        DISCORD_RESPONSE_CHUNK_LEN,
+        true,
+    )
+    .await
+    {
+        eprintln!("Falha ao responder /contract_session_summary: {err}");
+    }
+}
+
+async fn respond_contract_sessions(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_sessions: &ContractSessionStore,
+) {
+    let user_id = command.user.id.0;
+    let current_channel_id = command.channel_id.0;
+
+    let mut sessions = {
+        let guard = contract_sessions.lock().await;
+        guard
+            .iter()
+            .filter_map(|((channel_id, session_user_id), session)| {
+                if *session_user_id == user_id {
+                    Some((*channel_id, session.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if sessions.is_empty() {
+        let content = "Nao tens sessoes de contrato abertas/pausadas neste momento.".to_string();
+        let _ = create_interaction_response_in_chunks(
+            ctx,
+            command,
+            &content,
+            DISCORD_RESPONSE_CHUNK_LEN,
+            true,
+        )
+        .await;
+        return;
+    }
+
+    sessions.sort_by(|a, b| b.1.last_updated_at.cmp(&a.1.last_updated_at));
+
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Sessoes de contrato abertas/pausadas para <@{}> ({}):",
+        user_id,
+        sessions.len()
+    ));
+
+    for (channel_id, session) in sessions {
+        let status = match session.status {
+            SessionState::Active => "ativa",
+            SessionState::Paused => "pausada",
+        };
+        let current_marker = if channel_id == current_channel_id {
+            " [canal atual]"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "- Canal <#{}>{}: '{}' (ID: {}, estado: {}, turnos: {}).",
+            channel_id,
+            current_marker,
+            session.contract_title,
+            session.contract_id,
+            status,
+            session.turns.len()
+        ));
+    }
+
+    lines.push("Para retomar uma sessao: /contract_restore id:<id>.".to_string());
+    let content = lines.join("\n");
+
+    if let Err(err) = create_interaction_response_in_chunks(
+        ctx,
+        command,
+        &content,
+        DISCORD_RESPONSE_CHUNK_LEN,
+        true,
+    )
+    .await
+    {
+        eprintln!("Falha ao responder /contract_sessions: {err}");
+    }
+}
+
+async fn send_interaction_response_in_chunks(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    content: &str,
+    chunk_len: usize,
+    ephemeral: bool,
+) -> serenity::Result<()> {
+    let chunks = split_text_for_discord(content, chunk_len);
+    let first_chunk = chunks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "(sem conteudo)".to_string());
+
+    command
+        .edit_original_interaction_response(&ctx.http, |response| response.content(first_chunk))
+        .await?;
+
+    for chunk in chunks.into_iter().skip(1) {
+        command
+            .create_followup_message(&ctx.http, |message| {
+                message.content(chunk).ephemeral(ephemeral)
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn create_interaction_response_in_chunks(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    content: &str,
+    chunk_len: usize,
+    ephemeral: bool,
+) -> serenity::Result<()> {
+    let chunks = split_text_for_discord(content, chunk_len);
+    let first_chunk = chunks
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "(sem conteudo)".to_string());
+
+    command
+        .create_interaction_response(&ctx.http, |response| {
+            response
+                .kind(InteractionResponseType::ChannelMessageWithSource)
+                .interaction_response_data(|message| message.content(first_chunk).ephemeral(ephemeral))
+        })
+        .await?;
+
+    for chunk in chunks.into_iter().skip(1) {
+        command
+            .create_followup_message(&ctx.http, |message| {
+                message.content(chunk).ephemeral(ephemeral)
+            })
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn respond_contract_summary(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_summaries: &ContractExecutionSummaryStore,
+) {
+    let contract_id = get_string_option(command, "id").unwrap_or("");
+
+    if contract_id.is_empty() {
+        let _ = command
+            .create_interaction_response(&ctx.http, |response| {
+                response
+                    .kind(InteractionResponseType::ChannelMessageWithSource)
+                    .interaction_response_data(|message| {
+                        message.content("ID do contrato nao fornecido. Use /contract_summary id:<contract_id>")
+                    })
+            })
+            .await;
+        return;
+    }
+
+    let summaries = contract_summaries.lock().await;
+    let content = if let Some(summary) = summaries.get(contract_id) {
+        format!(
+            "📋 **Resumo de Execução - {}** (ID: {})\n\n**Tópico:** {}\n**Turnos:** {}\n**Duração:** {} segundos\n**Início:** <t:{}:f>\n**Fim:** <t:{}:f>\n\n**Pontos-chave:**\n{}",
+            summary.contract_title,
+            summary.contract_id,
+            summary.contract_topic,
+            summary.total_turns,
+            summary.execution_duration_seconds,
+            summary.execution_started_at,
+            summary.execution_ended_at,
+            summary
+                .key_points
+                .iter()
+                .enumerate()
+                .map(|(i, p)| format!("{}. {}", i + 1, p))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    } else {
+        format!(
+            "Nenhum resumo de execução encontrado para o contrato com ID: {}",
+            contract_id
+        )
+    };
+
+    if let Err(err) = create_interaction_response_in_chunks(ctx, command, &content, DISCORD_RESPONSE_CHUNK_LEN, true).await {
+        eprintln!("Falha ao responder /contract_summary: {err}");
+    }
+}
+
+
+
+fn current_unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 async fn respond_parts(ctx: &Context, command: &ApplicationCommandInteraction) {
@@ -1348,17 +1794,12 @@ async fn respond_parts(ctx: &Context, command: &ApplicationCommandInteraction) {
     }
 
     let contract = build_parts_contract(tema);
-    let response_text = truncate_for_discord(&contract, 1900);
 
-    if let Err(err) = command
-        .create_interaction_response(&ctx.http, |response| {
-            response
-                .kind(InteractionResponseType::ChannelMessageWithSource)
-                .interaction_response_data(|message| message.content(response_text.clone()))
-        })
-        .await
+    if let Err(err) =
+        create_interaction_response_in_chunks(ctx, command, &contract, DISCORD_RESPONSE_CHUNK_LEN, false)
+            .await
     {
-        eprintln!("Falha ao responder /parts: {err}");
+        eprintln!("Falha ao responder /parts em partes: {err}");
     }
 }
 
@@ -1409,7 +1850,14 @@ async fn respond_create_contract(
     }
 }
 
-async fn process_contract_message(ctx: &Context, msg: &Message, contracts: &ContractStore) {
+async fn process_contract_message(
+    ctx: &Context,
+    msg: &Message,
+    contracts: &ContractStore,
+    _contract_catalog: &ContractCatalogStore,
+    _contract_catalog_path: &str,
+    contract_message_store: &ContractMessageStore,
+) {
     if msg.author.bot {
         return;
     }
@@ -1540,6 +1988,33 @@ async fn process_contract_message(ctx: &Context, msg: &Message, contracts: &Cont
                 }
             };
 
+            let missing_fields: Vec<&str> = vec![
+                ("T - Tema", &theme),
+                ("A - Audience (público-alvo)", &audience),
+                ("P - Persona", &persona),
+                ("A - Act (Ação)", &act),
+                ("R - Responsibilities", &responsibilities),
+                ("S - Structure", &structure),
+                ("Expectations (Expectativas)", &expectations),
+            ]
+            .into_iter()
+            .filter(|(_, value)| value.is_empty())
+            .map(|(name, _)| name)
+            .collect();
+
+            if !missing_fields.is_empty() {
+                let _ = msg.channel_id.say(
+                    &ctx.http,
+                    format!(
+                        "Alguns elementos PARTS faltam:\n{}
+
+Por favor, completa todos os campos antes de guardar o contrato.",
+                        missing_fields.iter().map(|f| format!("- {}", f)).collect::<Vec<_>>().join("\n")
+                    ),
+                ).await;
+                return;
+            }
+
             {
                 let mut guard = contracts.lock().await;
                 guard.remove(&key);
@@ -1555,12 +2030,34 @@ async fn process_contract_message(ctx: &Context, msg: &Message, contracts: &Cont
                 &expectations,
             );
             
-            let parts: Vec<&str> = contract.split("---SPLIT---").collect();
-            for part in parts {
-                let response_text = truncate_for_discord(part.trim(), 1900);
-                if !response_text.is_empty() {
-                    let _ = msg.channel_id.say(&ctx.http, response_text).await;
+            let title = theme.clone();
+            let topic = audience.clone();
+
+            // Publicar o contrato completo numa unica mensagem e deixar apenas duas reacoes finais.
+            // Se o texto exceder o limite do Discord, enviamos a versao completa dividida, mas
+            // apenas a primeira mensagem recebe o estado de guardado/cancelado.
+            let chunks = split_text_for_discord(&contract, DISCORD_RESPONSE_CHUNK_LEN);
+            let mut last_sent_message: Option<serenity::model::channel::Message> = None;
+
+            for chunk in chunks.iter() {
+                if let Ok(sent_msg) = msg.channel_id.say(&ctx.http, chunk).await {
+                    // Guardar a ultima mensagem enviada
+                    last_sent_message = Some(sent_msg.clone());
                 }
+            }
+
+            if let Some(last_msg) = last_sent_message {
+                // Adicionar reacoes apenas na ultima mensagem e registar essa mensagem
+                let _ = last_msg.react(&ctx.http, serenity::model::prelude::ReactionType::Unicode("👍".to_string())).await;
+                let _ = last_msg.react(&ctx.http, serenity::model::prelude::ReactionType::Unicode("❌".to_string())).await;
+
+                let mut store = contract_message_store.lock().await;
+                store.insert(
+                    last_msg.id.0,
+                    (msg.channel_id.0, msg.author.id.0, String::new(), title.clone(), topic.clone(), contract.clone()),
+                );
+            } else {
+                let _ = msg.channel_id.say(&ctx.http, "Nao consegui publicar o contrato.").await;
             }
         }
     }
@@ -1597,7 +2094,7 @@ fn build_complete_parts_contract(
     expectations: &str,
 ) -> String {
     format!(
-        "CONTRATO PARTS COMPLETO\n\n=== CONTEXTO ===\n\nTema: {theme}\nPublico-alvo: {audience}\n\n---SPLIT---\n\n=== P - PERSONA ===\n\n{persona}\n\n---SPLIT---\n\n=== A - ACT (Metodologia) ===\n\n{act}\n\n---SPLIT---\n\n=== R - RESPONSIBILITIES (Responsabilidades) ===\n\n{responsibilities}\n\nRegra obrigatoria de conclusao:\n- A interacao so termina quando o estudante confirmar explicitamente que percebeu.\n- Nao terminar por numero maximo de frases, turnos ou interacoes.\n\n---SPLIT---\n\n=== T - THEME ===\n\nAprendizagem de: {theme}\nDirigido a: {audience}\n\nFoco: Desenvolver compreensao e capacidade pratica.\n\n---SPLIT---\n\n=== S - STRUCTURE (Sequencia de Interacao) ===\n\n{structure}\n\nInclui obrigatoriamente uma etapa de verificacao final de compreensao antes de encerrar.\n\n---SPLIT---\n\n=== EXPECTATIVAS FINAIS ===\n\n{expectations}\n\n---SPLIT---\n\n=== PROMPT PRONTO PARA USAR ===\n\nUsa este contrato PARTS de forma rigorosa para guiar a aprendizagem de {theme} para alguem ao nivel de {audience}.\n\nRegra critica: so podes concluir a sessao quando o estudante disser claramente que percebeu; nao concluas por limite de interacoes/frases.\n\nP (Persona): {persona}\nA (Acao): {act}\nR (Responsabilidades): {responsibilities}\nT (Tema): {theme}\nS (Estrutura): {structure}"
+        "CONTRATO PARTS COMPLETO\n\n=== CONTEXTO ===\n\nTema: {theme}\nPublico-alvo: {audience}\n\n=== P - PERSONA ===\n\n{persona}\n\n=== A - ACT (Metodologia) ===\n\n{act}\n\n=== R - RESPONSIBILITIES (Responsabilidades) ===\n\n{responsibilities}\n\nRegra obrigatoria de conclusao:\n- A interacao so termina quando o estudante confirmar explicitamente que percebeu.\n- Nao terminar por numero maximo de frases, turnos ou interacoes.\n\n=== T - THEME ===\n\nAprendizagem de: {theme}\nDirigido a: {audience}\n\nFoco: Desenvolver compreensao e capacidade pratica.\n\n=== S - STRUCTURE (Sequencia de Interacao) ===\n\n{structure}\n\nInclui obrigatoriamente uma etapa de verificacao final de compreensao antes de encerrar.\n\n=== EXPECTATIVAS FINAIS ===\n\n{expectations}\n\nReage com 👍 para guardar ou ❌ para cancelar."
     )
 }
 
@@ -1616,17 +2113,16 @@ fn get_string_option<'a>(
         .filter(|value| !value.is_empty())
 }
 
-fn normalize_conversation_name(raw_name: &str) -> (String, String) {
-    let trimmed = raw_name.trim();
-    let display_name: String = if trimmed.is_empty() {
-        DEFAULT_CONVERSATION_NAME.to_string()
-    } else {
-        trimmed.chars().take(MAX_CONVERSATION_NAME_LEN).collect()
-    };
+fn normalize_contract_id(raw_id: &str) -> String {
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
 
+    let display: String = trimmed.chars().take(MAX_CONTRACT_ID_LEN).collect();
     let mut id = String::new();
     let mut previous_was_separator = false;
-    for character in display_name.chars() {
+    for character in display.chars() {
         let normalized = character.to_ascii_lowercase();
         if normalized.is_ascii_alphanumeric() {
             id.push(normalized);
@@ -1637,46 +2133,7 @@ fn normalize_conversation_name(raw_name: &str) -> (String, String) {
         }
     }
 
-    let id = id.trim_matches('_').to_string();
-    let safe_id = if id.is_empty() {
-        DEFAULT_CONVERSATION_ID.to_string()
-    } else {
-        id
-    };
-
-    (safe_id, display_name)
-}
-
-fn format_conversation_list(user_conversations: &UserConversations) -> String {
-    let mut items: Vec<(String, usize, bool)> = user_conversations
-        .conversations
-        .iter()
-        .map(|(id, conversation)| {
-            (
-                conversation.name.clone(),
-                conversation.turns.len(),
-                id == &user_conversations.active_id,
-            )
-        })
-        .collect();
-
-    items.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
-
-    if items.is_empty() {
-        return "- (sem conversas)".to_string();
-    }
-
-    items
-        .into_iter()
-        .map(|(name, turns, active)| {
-            if active {
-                format!("- {name} [ativa] ({turns} turnos)")
-            } else {
-                format!("- {name} ({turns} turnos)")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    id.trim_matches('_').to_string()
 }
 
 fn load_conversations_from_disk(storage_path: &str) -> HashMap<ConversationKey, UserConversations> {
@@ -1706,7 +2163,9 @@ fn load_conversations_from_disk(storage_path: &str) -> HashMap<ConversationKey, 
 
     let mut store = HashMap::new();
     for entry in entries {
-        store.insert((entry.channel_id, entry.user_id), entry.data);
+        let mut normalized = entry.data;
+        normalized.ensure_active_exists();
+        store.insert((entry.channel_id, entry.user_id), normalized);
     }
 
     store
@@ -1739,6 +2198,203 @@ fn save_conversations_to_disk(
     fs::write(path, json).map_err(|err| format!("Erro a gravar conversas: {err}"))
 }
 
+fn load_contract_sessions_from_disk(
+    storage_path: &str,
+) -> HashMap<ConversationKey, ContractSession> {
+    let content = match fs::read_to_string(storage_path) {
+        Ok(content) => content,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Falha ao ler ficheiro de sessoes de contrato '{}': {err}",
+                    storage_path
+                );
+            }
+            return HashMap::new();
+        }
+    };
+
+    let entries: Vec<PersistedContractSessionEntry> = match serde_json::from_str(&content) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!(
+                "Falha ao parsear ficheiro de sessoes de contrato '{}': {err}",
+                storage_path
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut store = HashMap::new();
+    for entry in entries {
+        store.insert((entry.channel_id, entry.user_id), entry.data);
+    }
+
+    store
+}
+
+fn save_contract_sessions_to_disk(
+    storage_path: &str,
+    contract_sessions: &HashMap<ConversationKey, ContractSession>,
+) -> Result<(), String> {
+    let entries: Vec<PersistedContractSessionEntry> = contract_sessions
+        .iter()
+        .map(|((channel_id, user_id), data)| PersistedContractSessionEntry {
+            channel_id: *channel_id,
+            user_id: *user_id,
+            data: data.clone(),
+        })
+        .collect();
+
+    let json = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("Erro a serializar sessoes de contrato: {err}"))?;
+
+    let path = Path::new(storage_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Erro a criar diretorio de sessoes de contrato: {err}"))?;
+        }
+    }
+
+    fs::write(path, json).map_err(|err| format!("Erro a gravar sessoes de contrato: {err}"))
+}
+
+async fn persist_contract_sessions(contract_sessions: &ContractSessionStore, storage_path: &str) {
+    let snapshot = {
+        let guard = contract_sessions.lock().await;
+        guard.clone()
+    };
+
+    if let Err(err) = save_contract_sessions_to_disk(storage_path, &snapshot) {
+        eprintln!("Falha ao persistir sessoes de contrato: {err}");
+    }
+}
+
+fn load_contracts_from_disk(storage_path: &str) -> HashMap<String, StoredContract> {
+    let content = match fs::read_to_string(storage_path) {
+        Ok(content) => content,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Falha ao ler ficheiro de contratos '{}': {err}",
+                    storage_path
+                );
+            }
+            return HashMap::new();
+        }
+    };
+
+    let entries: Vec<StoredContract> = match serde_json::from_str(&content) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!(
+                "Falha ao parsear ficheiro de contratos '{}': {err}",
+                storage_path
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut store = HashMap::new();
+    for contract in entries {
+        store.insert(contract.id.clone(), contract);
+    }
+
+    store
+}
+
+fn save_contracts_to_disk(
+    storage_path: &str,
+    contracts: &HashMap<String, StoredContract>,
+) -> Result<(), String> {
+    let mut entries: Vec<StoredContract> = contracts.values().cloned().collect();
+    entries.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let json = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("Erro a serializar contratos: {err}"))?;
+
+    let path = Path::new(storage_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Erro a criar diretorio de contratos: {err}"))?;
+        }
+    }
+
+    fs::write(path, json).map_err(|err| format!("Erro a gravar contratos: {err}"))
+}
+
+fn load_execution_summaries_from_disk(storage_path: &str) -> HashMap<String, ContractExecutionSummary> {
+    let content = match fs::read_to_string(storage_path) {
+        Ok(content) => content,
+        Err(err) => {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "Falha ao ler ficheiro de resumos '{}': {err}",
+                    storage_path
+                );
+            }
+            return HashMap::new();
+        }
+    };
+
+    let entries: Vec<PersistedExecutionSummaryEntry> = match serde_json::from_str(&content) {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            eprintln!(
+                "Falha ao parsear ficheiro de resumos '{}': {err}",
+                storage_path
+            );
+            return HashMap::new();
+        }
+    };
+
+    let mut store = HashMap::new();
+    for entry in entries {
+        store.insert(entry.contract_id, entry.summary);
+    }
+
+    store
+}
+
+fn save_execution_summaries_to_disk(
+    storage_path: &str,
+    summaries: &HashMap<String, ContractExecutionSummary>,
+) -> Result<(), String> {
+    let mut entries: Vec<PersistedExecutionSummaryEntry> = summaries
+        .iter()
+        .map(|(contract_id, summary)| PersistedExecutionSummaryEntry {
+            contract_id: contract_id.clone(),
+            summary: summary.clone(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.contract_id.cmp(&b.contract_id));
+
+    let json = serde_json::to_string_pretty(&entries)
+        .map_err(|err| format!("Erro a serializar resumos: {err}"))?;
+
+    let path = Path::new(storage_path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("Erro a criar diretorio de resumos: {err}"))?;
+        }
+    }
+
+    fs::write(path, json).map_err(|err| format!("Erro a gravar resumos: {err}"))
+}
+
+async fn persist_execution_summaries(
+    summaries: &ContractExecutionSummaryStore,
+    storage_path: &str,
+) {
+    let guard = summaries.lock().await;
+    if let Err(err) = save_execution_summaries_to_disk(storage_path, &*guard) {
+        eprintln!("Falha ao persistir resumos: {err}");
+    }
+}
+
 async fn remember_turn(
     conversations: &ConversationStore,
     key: ConversationKey,
@@ -1749,7 +2405,6 @@ async fn remember_turn(
 ) {
     let user = truncate_for_history(user_prompt, MAX_TURN_TEXT_LEN);
     let assistant = truncate_for_history(assistant_answer, MAX_TURN_TEXT_LEN);
-
     let snapshot = {
         let mut guard = conversations.lock().await;
         let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
@@ -1777,6 +2432,76 @@ async fn remember_turn(
     }
 }
 
+async fn remember_contract_session_turn(
+    contract_sessions: &ContractSessionStore,
+    contract_sessions_path: &str,
+    key: ConversationKey,
+    user_prompt: &str,
+    assistant_answer: &str,
+) {
+    let user = truncate_for_history(user_prompt, MAX_TURN_TEXT_LEN);
+    let assistant = truncate_for_history(assistant_answer, MAX_TURN_TEXT_LEN);
+
+    let mut guard = contract_sessions.lock().await;
+    if let Some(session) = guard.get_mut(&key) {
+        session.turns.push(ConversationTurn { user, assistant });
+        session.last_updated_at = current_unix_timestamp();
+
+        if session.turns.len() > MAX_HISTORY_TURNS {
+            let extra = session.turns.len() - MAX_HISTORY_TURNS;
+            session.turns.drain(0..extra);
+        }
+    }
+
+    let snapshot = guard.clone();
+    drop(guard);
+
+    if let Err(err) = save_contract_sessions_to_disk(contract_sessions_path, &snapshot) {
+        eprintln!("Falha ao persistir turno de sessao de contrato: {err}");
+    }
+}
+
+async fn respond_conversation_clear(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    conversations: &ConversationStore,
+    conversations_path: &str,
+) {
+    let key = (command.channel_id.0, command.user.id.0);
+
+    let snapshot = {
+        let mut guard = conversations.lock().await;
+        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
+        user_conversations.active_id = DEFAULT_CONVERSATION_ID.to_string();
+        user_conversations.conversations.clear();
+        user_conversations.conversations.insert(
+            DEFAULT_CONVERSATION_ID.to_string(),
+            StoredConversation {
+                name: DEFAULT_CONVERSATION_NAME.to_string(),
+                turns: Vec::new(),
+            },
+        );
+        guard.clone()
+    };
+
+    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
+        eprintln!("Falha ao limpar conversa principal: {err}");
+    }
+
+    let content = "Conversa principal limpa com sucesso.";
+    if let Err(err) = create_interaction_response_in_chunks(
+        ctx,
+        command,
+        content,
+        DISCORD_RESPONSE_CHUNK_LEN,
+        true,
+    )
+    .await
+    {
+        eprintln!("Falha ao responder /conversation_clear: {err}");
+    }
+}
+
 fn truncate_for_history(text: &str, max_len: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_len {
@@ -1796,6 +2521,60 @@ fn truncate_for_discord(text: &str, max_len: usize) -> String {
     format!("{truncated}...")
 }
 
+fn split_text_for_discord(text: &str, max_len: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return vec!["(sem conteudo)".to_string()];
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.len() <= max_len {
+        return vec![trimmed.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= max_len {
+            let tail: String = chars[start..].iter().collect();
+            let tail = tail.trim();
+            if !tail.is_empty() {
+                chunks.push(tail.to_string());
+            }
+            break;
+        }
+
+        let end = start + max_len;
+        let mut split = end;
+        while split > start + 1 && !chars[split - 1].is_whitespace() {
+            split -= 1;
+        }
+
+        if split == start + 1 {
+            split = end;
+        }
+
+        let piece: String = chars[start..split].iter().collect();
+        let piece = piece.trim();
+        if !piece.is_empty() {
+            chunks.push(piece.to_string());
+        }
+
+        start = split;
+        while start < chars.len() && chars[start].is_whitespace() {
+            start += 1;
+        }
+    }
+
+    if chunks.is_empty() {
+        vec![trimmed.to_string()]
+    } else {
+        chunks
+    }
+}
+
 pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
     let message_content_enabled = env::var("DISCORD_ENABLE_MESSAGE_CONTENT")
         .ok()
@@ -1807,8 +2586,16 @@ pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
 
     let conversations_path = env::var("CONVERSATIONS_STORE_PATH")
         .unwrap_or_else(|_| "data/conversations.json".to_string());
+    let contract_catalog_path = env::var("CONTRACTS_STORE_PATH")
+        .unwrap_or_else(|_| "data/contracts.json".to_string());
+    let contract_sessions_path = env::var("CONTRACT_SESSIONS_STORE_PATH")
+        .unwrap_or_else(|_| "data/contract_sessions.json".to_string());
+    let contract_summaries_path = env::var("CONTRACT_SUMMARIES_STORE_PATH")
+        .unwrap_or_else(|_| "data/contract_summaries.json".to_string());
 
-    let mut intents = GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES;
+    let mut intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::GUILD_MESSAGE_REACTIONS;
     if message_content_enabled {
         intents |= GatewayIntents::MESSAGE_CONTENT;
     }
@@ -1823,14 +2610,37 @@ pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
     );
 
     let loaded_conversations = load_conversations_from_disk(&conversations_path);
+    let loaded_contracts = load_contracts_from_disk(&contract_catalog_path);
+    let loaded_contract_sessions = load_contract_sessions_from_disk(&contract_sessions_path);
+    let loaded_summaries = load_execution_summaries_from_disk(&contract_summaries_path);
     println!(
         "Persistencia de conversas: '{}' ({} registos carregados)",
         conversations_path,
         loaded_conversations.len()
     );
+    println!(
+        "Catalogo de contratos: '{}' ({} contratos carregados)",
+        contract_catalog_path,
+        loaded_contracts.len()
+    );
+    println!(
+        "Sessoes de contrato: '{}' ({} registos carregados)",
+        contract_sessions_path,
+        loaded_contract_sessions.len()
+    );
+    println!(
+        "Resumos de execução: '{}' ({} resumos carregados)",
+        contract_summaries_path,
+        loaded_summaries.len()
+    );
 
     let conversations = Arc::new(Mutex::new(loaded_conversations));
     let contracts = Arc::new(Mutex::new(HashMap::new()));
+    let contract_catalog = Arc::new(Mutex::new(loaded_contracts));
+    let contract_sessions = Arc::new(Mutex::new(loaded_contract_sessions));
+    let pending_uploads = Arc::new(Mutex::new(HashMap::new()));
+    let contract_message_store = Arc::new(Mutex::new(HashMap::new()));
+    let contract_summaries = Arc::new(Mutex::new(loaded_summaries));
 
     let mut client = Client::builder(token, intents)
         .event_handler(Handler {
@@ -1838,6 +2648,14 @@ pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
             conversations,
             conversations_path,
             contracts,
+            contract_catalog,
+            contract_catalog_path,
+            contract_sessions,
+            contract_sessions_path,
+            pending_uploads,
+            contract_message_store,
+            contract_summaries,
+            contract_summaries_path,
             message_content_enabled,
         })
         .await?;
