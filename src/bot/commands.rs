@@ -5,6 +5,8 @@ use serenity::model::application::interaction::application_command::ApplicationC
 use serenity::model::application::interaction::Interaction;
 use serenity::model::id::GuildId;
 
+// Registra os comandos slash na guild especificada, quando disponível, ou globalmente.
+// A guild específica acelera o ciclo de teste, enquanto a abordagem global torna os comandos visíveis em todos os servidores.
 pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity::Result<()> {
     if let Some(guild_id) = guild_id {
         GuildId(guild_id)
@@ -306,6 +308,8 @@ pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity
     }
 }
 
+// Encaminha cada interação de comando para o handler apropriado.
+// Isso centraliza o roteamento e evita espalhar a lógica de despacho por vários pontos do código.
 pub async fn dispatch_application_command(
     handler: &super::Handler,
     ctx: &Context,
