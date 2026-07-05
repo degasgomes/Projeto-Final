@@ -27,6 +27,8 @@ const DISCORD_RESPONSE_CHUNK_LEN: usize = 1900;
 const DEFAULT_CONVERSATION_ID: &str = "principal";
 const DEFAULT_CONVERSATION_NAME: &str = "Principal";
 
+// Representa um turno simples de conversa entre utilizador e assistente.
+// Essa estrutura é persistida para reconstruir o histórico em reinicializações do bot.
 #[derive(Clone, Serialize, Deserialize)]
 struct ConversationTurn {
     user: String,
@@ -188,6 +190,7 @@ struct PersistedExecutionSummaryEntry {
 
 #[derive(Clone, Debug)]
 enum ContractStep {
+    Title,
     Theme,
     Audience,
     PersonaDefinition,
@@ -200,6 +203,8 @@ enum ContractStep {
 #[derive(Clone)]
 struct ContractDraft {
     step: ContractStep,
+    message_id: Option<u64>,
+    title: Option<String>,
     theme: Option<String>,
     audience: Option<String>,
     persona: Option<String>,
@@ -212,7 +217,9 @@ struct ContractDraft {
 impl ContractDraft {
     fn new() -> Self {
         Self {
-            step: ContractStep::Theme,
+            step: ContractStep::Title,
+            message_id: None,
+            title: None,
             theme: None,
             audience: None,
             persona: None,
@@ -228,6 +235,8 @@ pub fn status() -> &'static str {
     "bot-ok"
 }
 
+// Estado global do bot, incluindo os stores em memória e os caminhos para os arquivos persistidos.
+// Esse objeto é compartilhado pelos eventos do Discord e concentra o estado do sistema.
 struct Handler {
     guild_id: Option<u64>,
     conversations: ConversationStore,
@@ -245,6 +254,7 @@ struct Handler {
 }
 
 #[async_trait]
+// Implementa os eventos principais do bot Discord: registro, comandos, mensagens e reações.
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         let register_result = commands::register_commands(&ctx, self.guild_id).await;
@@ -701,6 +711,12 @@ async fn respond_contract_upload_finish(
             })
             .await;
         return;
+    }
+
+    let (removed, snapshot) = {
+        let mut guard = contract_catalog.lock().await;
+        let removed = guard.remove(&contract_id).is_some();
+        (removed, guard.clone())
     };
 
     if pending.content.trim().is_empty() {
@@ -980,6 +996,8 @@ async fn upsert_contract(
             contract_id, title, topic
         )
     }
+
+    Ok(())
 }
 
 async fn respond_contract_list(
@@ -1813,6 +1831,7 @@ async fn respond_create_contract(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
     contracts: &ContractStore,
+    contract_draft_message_store: &ContractDraftMessageStore,
     message_content_enabled: bool,
 ) {
     if !message_content_enabled {
@@ -1834,19 +1853,45 @@ async fn respond_create_contract(
         guard.insert(key, ContractDraft::new());
     }
 
+    // Responder brevemente à interação
     if let Err(err) = command
         .create_interaction_response(&ctx.http, |response| {
             response
                 .kind(InteractionResponseType::ChannelMessageWithSource)
                 .interaction_response_data(|message| {
-                    message.content(
-                        "Vamos criar um contrato PARTS completo.\nIsto vai ter 7 perguntas para cobrir todos os pilares.\n\nPergunta 1/7: O que queres aprender? (Tema - T)",
-                    )
+                    message.content("Vamos começar! Responde às perguntas abaixo.")
+                        .ephemeral(true)
                 })
         })
         .await
     {
         eprintln!("Falha ao responder /createcontract: {err}");
+        return;
+    }
+
+    // Criar a primeira mensagem com pergunta e reação ❌
+    let initial_msg_result = command.channel_id.say(&ctx.http,
+        "Vamos criar um contrato PARTS completo.\nIsto vai ter 8 perguntas para cobrir todos os pilares.\n\nPergunta 1/8: Qual é o título do contrato? (ex: 'Mitologia Grega para Iniciantes')\n\nReage com ❌ para cancelar a criação."
+    ).await;
+
+    if let Ok(initial_msg) = initial_msg_result {
+        // Adicionar reação ❌
+        let _ = initial_msg.react(&ctx.http, serenity::model::prelude::ReactionType::Unicode("❌".to_string())).await;
+
+        // Guardar a message_id no draft e no store
+        {
+            let mut guard = contracts.lock().await;
+            if let Some(draft) = guard.get_mut(&key) {
+                draft.message_id = Some(initial_msg.id.0);
+            }
+        }
+
+        {
+            let mut store = contract_draft_message_store.lock().await;
+            store.insert(initial_msg.id.0, (command.channel_id.0, command.user.id.0));
+        }
+    } else {
+        eprintln!("Falha ao criar mensagem inicial para /createcontract");
     }
 }
 
@@ -1878,6 +1923,19 @@ async fn process_contract_message(
     };
 
     match draft.step {
+        ContractStep::Title => {
+            {
+                let mut guard = contracts.lock().await;
+                if let Some(current) = guard.get_mut(&key) {
+                    current.title = Some(input.to_string());
+                    current.step = ContractStep::Theme;
+                }
+            }
+            let _ = msg
+                .channel_id
+                .say(&ctx.http, "Pergunta 2/8: O que queres aprender? (Tema - T)")
+                .await;
+        }
         ContractStep::Theme => {
             {
                 let mut guard = contracts.lock().await;
@@ -1888,7 +1946,7 @@ async fn process_contract_message(
             }
             let _ = msg
                 .channel_id
-                .say(&ctx.http, "Pergunta 2/7: Para quem é? Qual é o nível do utilizador? (ex: principiante, intermédio, avançado)")
+                .say(&ctx.http, "Pergunta 3/8: Para quem é? Qual é o nível do utilizador? (ex: principiante, intermédio, avançado)")
                 .await;
         }
         ContractStep::Audience => {
@@ -1901,7 +1959,7 @@ async fn process_contract_message(
             }
             let _ = msg
                 .channel_id
-                .say(&ctx.http, "Pergunta 3/7: Que perfil tem o bot? (especialista, mentor, coach, etc - descreve em poucas palavras)")
+                .say(&ctx.http, "Pergunta 4/8: Que perfil tem o bot? (especialista, mentor, coach, etc - descreve em poucas palavras)")
                 .await;
         }
         ContractStep::PersonaDefinition => {
@@ -1924,7 +1982,7 @@ async fn process_contract_message(
                 .say(
                     &ctx.http,
                     format!(
-                        "Validacao da persona para '{theme}':\n{}\n\nPergunta 4/7: Como deve agir o bot? Que metodologia usas? (ex: socratica, prática com exemplos, passo-a-passo)",
+                        "Validacao da persona para '{theme}':\n{}\n\nPergunta 5/8: Como deve agir o bot? Que metodologia usas? (ex: socratica, prática com exemplos, passo-a-passo)",
                         validation
                     ),
                 )
@@ -1940,7 +1998,7 @@ async fn process_contract_message(
             }
             let _ = msg
                 .channel_id
-                .say(&ctx.http, "Pergunta 5/7: Quais são as responsabilidades do bot? O que deve e não deve fazer? (ex: sempre explicar o porquê, não inventar factos)")
+                .say(&ctx.http, "Pergunta 6/8: Quais são as responsabilidades do bot? O que deve e não deve fazer? (ex: sempre explicar o porquê, não inventar factos)")
                 .await;
         }
         ContractStep::Responsibilities => {
@@ -1953,7 +2011,7 @@ async fn process_contract_message(
             }
             let _ = msg
                 .channel_id
-                .say(&ctx.http, "Pergunta 6/7: Qual é a sequência/estrutura de passos na interação? (ex: check → explore → guide → validate → reflect)")
+                .say(&ctx.http, "Pergunta 7/8: Qual é a sequência/estrutura de passos na interação? (ex: check → explore → guide → validate → reflect)")
                 .await;
         }
         ContractStep::Structure => {
@@ -1966,15 +2024,16 @@ async fn process_contract_message(
             }
             let _ = msg
                 .channel_id
-                .say(&ctx.http, "Pergunta 7/7: Quais são as expectativas finais? O que deverá o utilizador conseguir fazer no final?")
+                .say(&ctx.http, "Pergunta 8/8: Quais são as expectativas finais? O que deverá o utilizador conseguir fazer no final?")
                 .await;
         }
         ContractStep::Expectations => {
-            let (theme, audience, persona, act, responsibilities, structure, expectations) = {
+            let (title, theme, audience, persona, act, responsibilities, structure, expectations) = {
                 let mut guard = contracts.lock().await;
                 if let Some(current) = guard.get_mut(&key) {
                     current.expectations = Some(input.to_string());
                     (
+                        current.title.clone().unwrap_or_default(),
                         current.theme.clone().unwrap_or_default(),
                         current.audience.clone().unwrap_or_default(),
                         current.persona.clone().unwrap_or_default(),

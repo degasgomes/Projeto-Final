@@ -28,7 +28,7 @@ Projeto em Rust com bot Discord, API HTTP e integracao com IA generativa.
 - Chave Gemini (`GEMINI_API_KEY`)
 - Opcional: chave OpenRouter (`OPENROUTER_API_KEY`)
 
-## Execucao local
+## Configuração local
 
 Cria um ficheiro `.env` na raiz do projeto:
 
@@ -36,6 +36,7 @@ Cria um ficheiro `.env` na raiz do projeto:
 DISCORD_TOKEN=seu_token_do_bot
 DISCORD_GUILD_ID=id_do_servidor_opcional
 DISCORD_ENABLE_MESSAGE_CONTENT=0
+PORT=3000
 PORT=3001
 
 GEMINI_API_KEY=sua_chave_gemini
@@ -122,7 +123,7 @@ Exemplo:
 2. Em `429`, tenta OpenRouter (`OPENROUTER_API_KEY`).
 3. Se ambos falharem, devolve erro no Discord.
 
-## Notas de seguranca
+## IA e fallback
 
 - Nao publiques tokens/chaves em screenshots, commits ou chats.
 - Se uma chave for exposta, revoga e cria outra.
