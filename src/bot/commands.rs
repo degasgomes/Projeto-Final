@@ -5,8 +5,15 @@ use serenity::model::application::interaction::application_command::ApplicationC
 use serenity::model::application::interaction::Interaction;
 use serenity::model::id::GuildId;
 
+/// Regista todos os comandos slash do bot.
+///
+/// Quando uma guild é definida, os comandos são registados apenas naquela guild
+/// para permitir testes rápidos. Caso contrário, os comandos são registados de forma global.
 pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity::Result<()> {
     if let Some(guild_id) = guild_id {
+        // Limpa comandos globais antigos antes de registrar comandos de guilda.
+        let _ = Command::set_global_application_commands(&ctx.http, |commands| commands).await;
+
         GuildId(guild_id)
             .set_application_commands(&ctx.http, |commands| {
                 commands
@@ -21,11 +28,6 @@ pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity
                                     .kind(CommandOptionType::String)
                                     .required(true)
                             })
-                    })
-                    .create_application_command(|command| {
-                        command
-                            .name("conversation_clear")
-                            .description("Limpa a conversa principal (modo normal)")
                     })
                     .create_application_command(|command| {
                         command
@@ -143,6 +145,23 @@ pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity
                             .name("contract_sessions")
                             .description("Lista as sessoes de contrato abertas/pausadas do utilizador")
                     })
+                    .create_application_command(|command| {
+                        command
+                            .name("contract_summary")
+                            .description("Consulta o resumo de execucao de um contrato")
+                            .create_option(|option| {
+                                option
+                                    .name("id")
+                                    .description("ID do contrato para consultar resumo")
+                                    .kind(CommandOptionType::String)
+                                    .required(true)
+                            })
+                    })
+                    .create_application_command(|command| {
+                        command
+                            .name("status")
+                            .description("Mostra o status do API e do bot")
+                    })
             })
             .await
             .map(|_| ())
@@ -160,11 +179,6 @@ pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity
                                 .kind(CommandOptionType::String)
                                 .required(true)
                         })
-                })
-                .create_application_command(|command| {
-                    command
-                        .name("conversation_clear")
-                        .description("Limpa a conversa principal (modo normal)")
                 })
                 .create_application_command(|command| {
                     command
@@ -306,6 +320,10 @@ pub async fn register_commands(ctx: &Context, guild_id: Option<u64>) -> serenity
     }
 }
 
+/// Roteia a interação de comando para a função de tratamento correta.
+///
+/// Cada comando é processado por um handler separado para isolar a lógica e manter
+/// o dispatcher simples de ler.
 pub async fn dispatch_application_command(
     handler: &super::Handler,
     ctx: &Context,
@@ -319,14 +337,6 @@ pub async fn dispatch_application_command(
             &handler.conversations_path,
             &handler.contract_sessions,
             &handler.contract_sessions_path,
-        )
-        .await;
-    } else if command.data.name == "conversation_clear" {
-        super::respond_conversation_clear(
-            ctx,
-            command,
-            &handler.conversations,
-            &handler.conversations_path,
         )
         .await;
     } else if command.data.name == "status" {
