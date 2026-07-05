@@ -9,6 +9,11 @@ use tokio::time::sleep;
 const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const MAX_RETRIES: usize = 2;
+
+/// Instruções padrão enviadas a todos os prompts de IA.
+///
+/// Esta instrução força a formatação adequada para Discord e mantém o estilo
+/// de resposta consistente em todas as chamadas.
 const DISCORD_FORMAT_INSTRUCTION: &str = "Formate a mensagem para Discord:\n1. Responda de forma incremental, como uma conversa normal. Mostre apenas o que e novo nesta mensagem; nao repitas o que ja foi dito antes, nem reescrevas o contexto, a introducao ou os titulos anteriores.\n2. Se houver continuidade de uma resposta anterior, continua diretamente a partir dela sem refazer o resumo inicial.\n3. Respeite a formatacao de texto do Discord (negrito, italico, listas, etc).\n4. Limite maximo por mensagem: 2000 caracteres. Nao quebre formatacao a meio de blocos.\n5. IMPORTANTE: Todo codigo deve estar em code blocks com language identifier. Exemplos: ```html, ```css, ```javascript, ```python, ```rust, etc. Isto garante syntax highlighting com cores no Discord.";
 
 #[derive(Debug)]
@@ -115,6 +120,9 @@ struct OpenRouterChoice {
     message: OpenRouterMessage,
 }
 
+/// Submete um prompt ao provedor de IA principal (Gemini) com instruções de formatação.
+///
+/// Quando Gemini devolve HTTP 429 e existe `OPENROUTER_API_KEY`, tenta fallback para OpenRouter.
 pub async fn submit_prompt(prompt: &str) -> Result<String, AiError> {
     let trimmed_prompt = prompt.trim();
     if trimmed_prompt.is_empty() {
@@ -147,6 +155,9 @@ pub async fn submit_prompt(prompt: &str) -> Result<String, AiError> {
     }
 }
 
+/// Submete um prompt juntamente com o histórico de conversa para manter contexto.
+///
+/// Ideal para fluxos em que a IA deve responder com base em turns anteriores.
 pub async fn submit_prompt_with_history(
     prompt: &str,
     history: &[(String, String)],
@@ -169,6 +180,7 @@ turnos ou interacoes; so conclui quando o estudante confirmar explicitamente que
     submit_prompt(&enriched_prompt).await
 }
 
+/// Envia o prompt ao endpoint Gemini e trata repetição de 429 com retry.
 async fn submit_with_gemini(prompt: &str) -> Result<String, AiError> {
     let api_key = env::var("GEMINI_API_KEY").map_err(|_| AiError::MissingApiKey)?;
     let model = env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".to_string());
@@ -227,6 +239,7 @@ async fn submit_with_gemini(prompt: &str) -> Result<String, AiError> {
     }
 }
 
+/// Envia o prompt ao fallback OpenRouter quando Gemini não está disponível.
 async fn submit_with_openrouter(prompt: &str) -> Result<String, AiError> {
     let api_key = env::var("OPENROUTER_API_KEY").map_err(|_| AiError::MissingOpenRouterApiKey)?;
     let model = env::var("OPENROUTER_MODEL")
