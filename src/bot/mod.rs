@@ -1,3 +1,8 @@
+//! Código principal do bot Discord e da lógica de contrato.
+//!
+//! Este módulo define o estado em memória, o fluxo de eventos do Discord e
+//! a persistência local dos dados de conversas, contratos, sessões e resumos.
+
 use serenity::async_trait;
 use serenity::client::{Context, EventHandler};
 use serenity::model::application::interaction::application_command::ApplicationCommandInteraction;
@@ -17,6 +22,8 @@ use tokio::sync::Mutex;
 
 mod commands;
 
+// Limites e valores padrão utilizados pelo bot para manter o estado controlado.
+// Isso ajuda a prevenir uso excessivo de memória e textos demasiado longos.
 const MAX_HISTORY_TURNS: usize = 6;
 const MAX_TURN_TEXT_LEN: usize = 700;
 const MAX_CONTRACT_ID_LEN: usize = 48;
@@ -24,17 +31,21 @@ const MAX_CONTRACT_TITLE_LEN: usize = 80;
 const MAX_CONTRACT_TOPIC_LEN: usize = 80;
 const MAX_CONTRACT_ATTACHMENT_BYTES: usize = 200_000;
 const DISCORD_RESPONSE_CHUNK_LEN: usize = 1900;
-const DEFAULT_CONVERSATION_ID: &str = "principal";
-const DEFAULT_CONVERSATION_NAME: &str = "Principal";
 
-// Representa um turno simples de conversa entre utilizador e assistente.
-// Essa estrutura é persistida para reconstruir o histórico em reinicializações do bot.
+/// Um turno de conversa entre o utilizador e o assistente.
+///
+/// O histórico guarda pares de mensagens para permitir contexto limitado
+/// em conversas normais e em sessões de contrato.
 #[derive(Clone, Serialize, Deserialize)]
 struct ConversationTurn {
     user: String,
     assistant: String,
 }
 
+/// Extrai trechos chave de uma sessão de contrato para o resumo de execução.
+///
+/// O método captura apenas as respostas do assistente nos turns pares para reduzir
+/// o ruído e gerar pontos de destaque legíveis.
 fn extract_key_points(turns: &[ConversationTurn]) -> Vec<String> {
     turns
         .iter()
@@ -54,88 +65,40 @@ fn extract_key_points(turns: &[ConversationTurn]) -> Vec<String> {
         .collect()
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct StoredConversation {
-    name: String,
-    turns: Vec<ConversationTurn>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct UserConversations {
-    active_id: String,
-    conversations: HashMap<String, StoredConversation>,
-}
-
+/// Conversas armazenadas para um utilizador/canal.
+///
+/// Mantém apenas a conversa principal por canal/utilizador.
 #[derive(Serialize, Deserialize)]
 struct PersistedConversationEntry {
     channel_id: u64,
     user_id: u64,
-    data: UserConversations,
+    turns: Vec<ConversationTurn>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PersistedContractSessionEntry {
     channel_id: u64,
     user_id: u64,
     data: ContractSession,
 }
 
-impl UserConversations {
-    fn new() -> Self {
-        let mut conversations = HashMap::new();
-        conversations.insert(
-            DEFAULT_CONVERSATION_ID.to_string(),
-            StoredConversation {
-                name: DEFAULT_CONVERSATION_NAME.to_string(),
-                turns: Vec::new(),
-            },
-        );
-
-        Self {
-            active_id: DEFAULT_CONVERSATION_ID.to_string(),
-            conversations,
-        }
-    }
-
-    fn ensure_active_exists(&mut self) {
-        let mut principal_turns = self
-            .conversations
-            .get(&self.active_id)
-            .map(|conversation| conversation.turns.clone())
-            .or_else(|| {
-                self.conversations
-                    .get(DEFAULT_CONVERSATION_ID)
-                    .map(|conversation| conversation.turns.clone())
-            })
-            .unwrap_or_default();
-
-        if principal_turns.len() > MAX_HISTORY_TURNS {
-            let extra = principal_turns.len() - MAX_HISTORY_TURNS;
-            principal_turns.drain(0..extra);
-        }
-
-        self.active_id = DEFAULT_CONVERSATION_ID.to_string();
-        self.conversations.clear();
-        self.conversations
-            .entry(self.active_id.clone())
-            .or_insert_with(|| StoredConversation {
-                name: DEFAULT_CONVERSATION_NAME.to_string(),
-                turns: principal_turns,
-            });
-    }
-}
-
 type ConversationKey = (u64, u64);
-type ConversationStore = Arc<Mutex<HashMap<ConversationKey, UserConversations>>>;
+type ConversationStore = Arc<Mutex<HashMap<ConversationKey, Vec<ConversationTurn>>>>;
 type ContractStore = Arc<Mutex<HashMap<ConversationKey, ContractDraft>>>;
 type ContractCatalogStore = Arc<Mutex<HashMap<String, StoredContract>>>;
 type ContractSessionStore = Arc<Mutex<HashMap<ConversationKey, ContractSession>>>;
 type PendingUploadStore = Arc<Mutex<HashMap<ConversationKey, PendingContractUpload>>>;
 // message_id -> (channel_id, user_id, contract_id, title, topic, content)
 type ContractMessageStore = Arc<Mutex<HashMap<u64, (u64, u64, String, String, String, String)>>>;
+// message_id -> (channel_id, user_id) para drafts em criação
+type ContractDraftMessageStore = Arc<Mutex<HashMap<u64, (u64, u64)>>>;
 // contract_id -> ContractExecutionSummary
 type ContractExecutionSummaryStore = Arc<Mutex<HashMap<String, ContractExecutionSummary>>>;
 
+/// Um contrato guardado no catálogo local.
+///
+/// Os contratos são usados para sessões de aprendizagem guiadas e podem ser
+/// iniciados, pausados e restaurados pelo utilizador.
 #[derive(Clone, Serialize, Deserialize)]
 struct StoredContract {
     id: String,
@@ -145,12 +108,20 @@ struct StoredContract {
     created_at: u64,
 }
 
+/// Estado de uma sessão de contrato.
+///
+/// `Active` indica que a próxima interação `/ask` usa o contrato como contexto.
+/// `Paused` mantém a sessão salva, mas não afeta as respostas normais.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 enum SessionState {
     Active,
     Paused,
 }
 
+/// Estado completo de uma sessão de contrato em execução.
+///
+/// Guarda o contrato, o estado atual, o histórico de turns e um timestamp de
+/// atualização para listagens e restauração posterior.
 #[derive(Clone, Serialize, Deserialize)]
 struct ContractSession {
     contract_id: String,
@@ -162,6 +133,7 @@ struct ContractSession {
     last_updated_at: u64,
 }
 
+/// Upload pendente de contrato quando o utilizador envia o contrato em várias mensagens.
 #[derive(Clone)]
 struct PendingContractUpload {
     id: String,
@@ -170,6 +142,9 @@ struct PendingContractUpload {
     content: String,
 }
 
+/// Resumo gerado ao pausar uma sessão de contrato.
+///
+/// Este resumo permite ao utilizador retomar o trabalho mais tarde com contexto.
 #[derive(Clone, Serialize, Deserialize)]
 struct ContractExecutionSummary {
     contract_id: String,
@@ -188,6 +163,9 @@ struct PersistedExecutionSummaryEntry {
     summary: ContractExecutionSummary,
 }
 
+/// Passos do fluxo guiado de criação de contratos PARTS.
+///
+/// Cada etapa corresponde a uma pergunta que o bot faz ao utilizador.
 #[derive(Clone, Debug)]
 enum ContractStep {
     Title,
@@ -200,6 +178,9 @@ enum ContractStep {
     Expectations,
 }
 
+/// Dados temporários durante a criação guiada de um contrato PARTS.
+///
+/// O draft cresce em cada mensagem enviada pelo utilizador até estar completo.
 #[derive(Clone)]
 struct ContractDraft {
     step: ContractStep,
@@ -235,8 +216,9 @@ pub fn status() -> &'static str {
     "bot-ok"
 }
 
-// Estado global do bot, incluindo os stores em memória e os caminhos para os arquivos persistidos.
-// Esse objeto é compartilhado pelos eventos do Discord e concentra o estado do sistema.
+/// Estado global do bot usado pelos handlers de eventos do Discord.
+///
+/// Contém os stores em memória e os caminhos para os ficheiros persistidos.
 struct Handler {
     guild_id: Option<u64>,
     conversations: ConversationStore,
@@ -248,15 +230,17 @@ struct Handler {
     contract_sessions_path: String,
     pending_uploads: PendingUploadStore,
     contract_message_store: ContractMessageStore,
+    contract_draft_message_store: ContractDraftMessageStore,
     contract_summaries: ContractExecutionSummaryStore,
     contract_summaries_path: String,
     message_content_enabled: bool,
 }
 
 #[async_trait]
-// Implementa os eventos principais do bot Discord: registro, comandos, mensagens e reações.
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
+        // Quando o bot fica pronto, registamos os comandos slash e
+        // confirmamos se eles são globais ou específicos da guild.
         let register_result = commands::register_commands(&ctx, self.guild_id).await;
 
         if let Err(err) = register_result {
@@ -274,6 +258,7 @@ impl EventHandler for Handler {
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        // Somente processar interações de comando aplicacional.
         let Some(command) = commands::as_application_command(interaction) else {
             return;
         };
@@ -282,6 +267,7 @@ impl EventHandler for Handler {
     }
 
     async fn message(&self, ctx: Context, msg: Message) {
+        // Mensagens podem servir para upload pendente de contrato.
         if process_pending_contract_upload_message(
             &ctx,
             &msg,
@@ -292,6 +278,7 @@ impl EventHandler for Handler {
             return;
         }
 
+        // Se não houver upload pendente, tratar mensagens de criação de contrato.
         process_contract_message(
             &ctx,
             &msg,
@@ -303,14 +290,37 @@ impl EventHandler for Handler {
     }
 
     async fn reaction_add(&self, ctx: Context, add_reaction: serenity::model::channel::Reaction) {
-        // Apenas duas acoes finais: guardar (👍) ou cancelar (❌)
+        // Reações controlam confirmações de contrato (guardar/cancelar) e
+        // permitem cancelar drafts de criação de contrato em andamento.
         let emoji = add_reaction.emoji.to_string();
+        let reacting_user = add_reaction.user_id.unwrap_or_default().0;
 
+        // Verificar se é uma reação a um draft em criação
+        if emoji == "❌" {
+            let draft_store = self.contract_draft_message_store.lock().await;
+            if let Some((channel_id, user_id)) = draft_store.get(&add_reaction.message_id.0).cloned() {
+                drop(draft_store);
+
+                // Só o criador pode cancelar
+                if reacting_user == user_id {
+                    let key = (channel_id, user_id);
+                    let mut contracts = self.contracts.lock().await;
+                    contracts.remove(&key);
+
+                    let ch = serenity::model::prelude::ChannelId(channel_id);
+                    let _ = ch.say(&ctx.http, "❌ Criação de contrato cancelada pelo autor.").await;
+
+                    let mut store = self.contract_draft_message_store.lock().await;
+                    store.remove(&add_reaction.message_id.0);
+                }
+                return;
+            }
+        }
+
+        // Apenas duas acoes finais: guardar (👍) ou cancelar (❌)
         let store = self.contract_message_store.lock().await;
         if let Some((channel_id, author_user_id, _contract_id, title, topic, content)) = store.get(&add_reaction.message_id.0).cloned() {
             drop(store); // Liberar lock antes de fazer chamadas async
-
-            let reacting_user = add_reaction.user_id.unwrap_or_default().0;
 
             // Guardar: so o autor pode confirmar com 👍
             if emoji == "👍" {
@@ -356,6 +366,9 @@ impl EventHandler for Handler {
     }
 }
 
+/// Gera o próximo ID numérico disponível para um contrato.
+///
+/// Útil quando o usuário confirma um contrato via reação e não fornece um ID explícito.
 async fn generate_next_numeric_contract_id(contract_catalog: &ContractCatalogStore) -> String {
     let guard = contract_catalog.lock().await;
     let mut max_id: u64 = 0;
@@ -369,6 +382,14 @@ async fn generate_next_numeric_contract_id(contract_catalog: &ContractCatalogSto
 
 
 
+/// Trata o comando `/ask`.
+///
+/// Se existir uma sessão de contrato ativa, a resposta é gerada dentro desse contexto.
+/// Caso contrário, responde usando a conversa normal do utilizador.
+/// Trata o comando `/ask` enviando o prompt para a IA.
+///
+/// Se o utilizador tiver uma sessão de contrato ativa, o prompt é enviado com
+/// o contexto do contrato para que a IA responda de acordo com o contrato.
 async fn respond_ask(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -414,24 +435,9 @@ async fn respond_ask(
         return;
     }
 
-    let (active_id, history_snapshot) = {
+    let history_snapshot = {
         let mut guard = conversations.lock().await;
-        let user_conversations = guard
-            .entry(conversation_key)
-            .or_insert_with(UserConversations::new);
-        user_conversations.ensure_active_exists();
-
-        let active_id = user_conversations.active_id.clone();
-        let active = user_conversations
-            .conversations
-            .get(&active_id)
-            .cloned()
-            .unwrap_or(StoredConversation {
-                name: DEFAULT_CONVERSATION_NAME.to_string(),
-                turns: Vec::new(),
-            });
-
-        (active_id, active.turns)
+        guard.entry(conversation_key).or_insert_with(Vec::new).clone()
     };
 
     let structured_history: Vec<(String, String)> = history_snapshot
@@ -483,7 +489,6 @@ async fn respond_ask(
                 remember_turn(
                     conversations,
                     conversation_key,
-                    &active_id,
                     prompt,
                     &answer,
                     conversations_path,
@@ -513,6 +518,11 @@ async fn respond_ask(
     }
 }
 
+/// Inicia ou grava um contrato pelo comando `/contract_upload`.
+///
+/// Se o conteúdo for fornecido diretamente no comando, o contrato é gravado
+/// imediatamente. Caso contrário, o bot entra em modo de upload pendente e
+/// aceita o texto em mensagens subsequentes.
 async fn respond_contract_upload(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -662,6 +672,7 @@ async fn respond_contract_upload(
     }
 }
 
+/// Cancela um upload de contrato pendente para o canal e utilizador atual.
 async fn respond_contract_upload_cancel(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -685,6 +696,7 @@ async fn respond_contract_upload_cancel(
     }
 }
 
+/// Finaliza um upload de contrato pendente gravando o conteúdo acumulado.
 async fn respond_contract_upload_finish(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -711,12 +723,6 @@ async fn respond_contract_upload_finish(
             })
             .await;
         return;
-    }
-
-    let (removed, snapshot) = {
-        let mut guard = contract_catalog.lock().await;
-        let removed = guard.remove(&contract_id).is_some();
-        (removed, guard.clone())
     };
 
     if pending.content.trim().is_empty() {
@@ -753,6 +759,10 @@ async fn respond_contract_upload_finish(
         .await;
 }
 
+/// Processa mensagens de texto/ficheiros enquanto o utilizador está em modo de upload pendente.
+///
+/// Retorna `true` se a mensagem pertencer ao fluxo de upload pendente e não deve
+/// ser tratada como mensagem normal do bot.
 async fn process_pending_contract_upload_message(
     ctx: &Context,
     msg: &Message,
@@ -819,6 +829,7 @@ async fn process_pending_contract_upload_message(
     true
 }
 
+/// Remove um contrato do catálogo e encerra as sessões associadas.
 async fn respond_contract_remove(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -904,6 +915,9 @@ async fn respond_contract_remove(
     }
 }
 
+/// Envia feedback privado ao utilizador por DM durante o fluxo de upload de contratos.
+///
+/// Quando a DM não é possível, o usuário é avisado no canal público para ativar DMs.
 async fn send_private_pending_upload_feedback(ctx: &Context, msg: &Message, content: &str) {
     let dm_result = msg
         .author
@@ -918,6 +932,10 @@ async fn send_private_pending_upload_feedback(ctx: &Context, msg: &Message, cont
     }
 }
 
+/// Tenta extrair texto de um anexo de contrato suportado.
+///
+/// Suporta apenas ficheiros `.txt`, `.md`, `.markdown` e `.json`, e retorna erro
+/// se o anexo estiver fora do formato ou for demasiado grande.
 async fn extract_contract_content_from_attachments(
     msg: &Message,
 ) -> Result<Option<String>, String> {
@@ -957,6 +975,9 @@ async fn extract_contract_content_from_attachments(
     Ok(Some(trimmed.to_string()))
 }
 
+/// Insere ou atualiza um contrato no catálogo e grava imediatamente no disco.
+///
+/// Retorna uma mensagem de sucesso indicando se foi criada uma nova entrada ou atualizada uma existente.
 async fn upsert_contract(
     contract_catalog: &ContractCatalogStore,
     contract_catalog_path: &str,
@@ -996,10 +1017,122 @@ async fn upsert_contract(
             contract_id, title, topic
         )
     }
-
-    Ok(())
 }
 
+/// Extrai a primeira frase ou cláusula mais curta de um texto para uso em sumários.
+fn first_sentence(text: &str) -> String {
+    // Try to extract a short first sentence or clause to summarise the content.
+    let cleaned = text.trim();
+    if cleaned.is_empty() {
+        return "(sem descrição)".to_string();
+    }
+
+    // Split on newlines first, then on sentence terminators.
+    let first_line = cleaned
+        .lines()
+        .map(|l| l.trim())
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+
+    let separators = ['.', '!', '?', '|', ';'];
+    for sep in &separators {
+        if let Some(pos) = first_line.find(*sep) {
+            let s = first_line[..pos].trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+
+    // Fallback: take up to 80 chars
+    let max = 80;
+    if first_line.chars().count() > max {
+        let short: String = first_line.chars().take(max - 3).collect();
+        format!("{}...", short)
+    } else if !first_line.is_empty() {
+        first_line.to_string()
+    } else {
+        "(sem descrição)".to_string()
+    }
+}
+
+fn truncate_topic(topic: &str, max_chars: usize) -> String {
+    let t = topic.trim();
+    if t.chars().count() <= max_chars {
+        return t.to_string();
+    }
+    let short: String = t.chars().take(max_chars.saturating_sub(3)).collect();
+    format!("{}...", short)
+}
+
+fn truncate_text(s: &str, max_len: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_len {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(max_len).collect();
+    match truncated.rfind(' ') {
+        Some(idx) => format!("{}...", &truncated[..idx].trim()),
+        None => format!("{}...", truncated.trim()),
+    }
+}
+
+fn learning_goal_from_content(content: &str, max_len: usize) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return "(objetivo não especificado)".to_string();
+    }
+
+    let lowered = normalized.to_ascii_lowercase();
+    let cues = [
+        "objetivo",
+        "objetivos",
+        "vai aprender",
+        "vai ser capaz",
+        "para alunos",
+        "para o aluno",
+        "aprender",
+        "o aluno",
+    ];
+
+    for cue in &cues {
+        if let Some(pos) = lowered.find(cue) {
+            let start = lowered[..pos]
+                .rfind(|c: char| c == '.' || c == '!' || c == '?')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let end = lowered[pos..]
+                .find(|c: char| c == '.' || c == '!' || c == '?')
+                .map(|i| pos + i)
+                .unwrap_or(normalized.len());
+
+            let snippet = normalized[start..end].trim();
+            return truncate_text(snippet, max_len);
+        }
+    }
+
+    // Fallback to first sentence or truncated content
+    let first = first_sentence(content);
+    if first == "(sem descrição)" {
+        truncate_text(&normalized, max_len)
+    } else {
+        truncate_text(&first, max_len)
+    }
+}
+
+/// Gera uma descrição resumida do contrato que destaca objetivo e tópico.
+fn extract_contract_about_summary(content: &str, topic: &str) -> String {
+    let goal = learning_goal_from_content(content, 120);
+    let topic_short = truncate_topic(topic, 60);
+
+    if topic.trim().is_empty() {
+        format!("Objetivo: {}", goal)
+    } else {
+        format!("Objetivo: {} — Tópico: {}", goal, topic_short)
+    }
+}
+
+/// Responde ao comando `/contract_list` com o catálogo atual de contratos.
 async fn respond_contract_list(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1016,9 +1149,12 @@ async fn respond_contract_list(
             let rows = contracts
                 .into_iter()
                 .map(|contract| {
+                    let about_summary = extract_contract_about_summary(&contract.content, &contract.topic);
                     format!(
-                        "- ID: {} | Titulo: {} | Topico: {}",
-                        contract.id, contract.title, contract.topic
+                        "- ID: {} | Titulo: {} | Sobre: {}",
+                        contract.id,
+                        contract.title,
+                        about_summary
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1038,6 +1174,10 @@ async fn respond_contract_list(
     }
 }
 
+/// Inicia ou restaura uma sessão de contrato usando `/contract_start`.
+///
+/// Se o utilizador já tiver uma sessão ativa para o mesmo contrato, mostra um
+/// resumo breve. Caso haja outra sessão ativa, orienta o utilizador a pausar primeiro.
 async fn respond_contract_start(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1213,6 +1353,7 @@ async fn respond_contract_start(
     }
 }
 
+/// Gera um resumo da sessão de contrato usando IA para ajudar o retomar posterior.
 async fn summarize_contract_session(session: &ContractSession) -> String {
     let status_label = match session.status {
         SessionState::Active => "ativa",
@@ -1261,6 +1402,7 @@ Metadados:\nContrato: {} (ID: {}, topico: {})\nEstado: {}\n\nInteracao:\n{}",
     }
 }
 
+/// Pausa a sessão de contrato ativa e grava um resumo de execução.
 async fn respond_contract_pause(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1323,6 +1465,7 @@ async fn respond_contract_pause(
     }
 }
 
+/// Restaura uma sessão de contrato pausada ou associa o canal a um contrato existente.
 async fn respond_contract_restore(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1486,6 +1629,7 @@ async fn respond_contract_restore(
     }
 }
 
+/// Cria um resumo legível da sessão de contrato atual usando IA quando apropriado.
 async fn respond_contract_session_summary(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1586,6 +1730,7 @@ Metadados:\nContrato: {} (ID: {}, topico: {})\nEstado: {}\n\nInteracao:\n{}",
     }
 }
 
+/// Lista as sessões de contrato abertas/pausadas do usuário atual.
 async fn respond_contract_sessions(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1667,6 +1812,9 @@ async fn respond_contract_sessions(
     }
 }
 
+/// Edita a resposta de interação existente e envia mensagens adicionais em seguida.
+///
+/// Útil para quando a resposta excede o limite de caracteres do Discord.
 async fn send_interaction_response_in_chunks(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1695,6 +1843,7 @@ async fn send_interaction_response_in_chunks(
     Ok(())
 }
 
+/// Cria uma nova resposta de interação e envia conteúdos que excedem o limite em follow-ups.
 async fn create_interaction_response_in_chunks(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1727,6 +1876,7 @@ async fn create_interaction_response_in_chunks(
     Ok(())
 }
 
+/// Retorna o resumo de execução salvo para um contrato específico.
 async fn respond_contract_summary(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1780,6 +1930,9 @@ async fn respond_contract_summary(
 
 
 
+/// Retorna o timestamp Unix atual em segundos.
+///
+/// Usa `UNIX_EPOCH` como referência e retorna 0 em caso de falha improvável.
 fn current_unix_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1787,7 +1940,15 @@ fn current_unix_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
-async fn respond_parts(ctx: &Context, command: &ApplicationCommandInteraction) {
+/// Responde ao comando `/parts` gerando um contrato PARTS rápido para um tema.
+///
+/// Publica o contrato no canal e adiciona reações para permitir que o autor
+/// salve ou cancele o conteúdo gerado.
+async fn respond_parts(
+    ctx: &Context,
+    command: &ApplicationCommandInteraction,
+    contract_message_store: &ContractMessageStore,
+) {
     let tema = command
         .data
         .options
@@ -1819,14 +1980,41 @@ async fn respond_parts(ctx: &Context, command: &ApplicationCommandInteraction) {
     {
         eprintln!("Falha ao responder /parts em partes: {err}");
     }
+
+    if let Ok(sent_msg) = command.get_interaction_response(&ctx.http).await {
+        let _ = sent_msg
+            .react(&ctx.http, serenity::model::prelude::ReactionType::Unicode("👍".to_string()))
+            .await;
+        let _ = sent_msg
+            .react(&ctx.http, serenity::model::prelude::ReactionType::Unicode("❌".to_string()))
+            .await;
+
+        let mut store = contract_message_store.lock().await;
+        store.insert(
+            sent_msg.id.0,
+            (
+                sent_msg.channel_id.0,
+                command.user.id.0,
+                String::new(),
+                tema.to_string(),
+                tema.to_string(),
+                contract,
+            ),
+        );
+    }
 }
 
+/// Constrói um contrato PARTS completo com base no tema fornecido.
 fn build_parts_contract(topic: &str) -> String {
     format!(
         "Semantica PARTS\n\nP - Persona: quem a IA deve ser (perfil/papel).\nA - Act: como deve agir e guiar o raciocinio.\nR - Responsibilities: obrigacoes, limites e qualidade esperada.\nT - Theme: foco central do conteudo.\nS - Structure: formato da interacao e passos da resposta.\n\nContrato PARTS para aprender: {topic}\n\nP - Persona\nTu es um especialista e mentor em {topic}. Ensina de forma clara, progressiva e adaptada ao nivel do estudante.\n\nA - Act\n1. Comeca por diagnosticar o nivel atual com perguntas curtas.\n2. Explica conceitos com exemplos simples e depois aumenta a complexidade.\n3. Usa perguntas de verificacao para confirmar entendimento antes de avancar.\n4. Evita entregar tudo pronto; conduz o estudante a construir a resposta.\n\nR - Responsibilities\n- Justificar cada decisao tecnica/conceitual.\n- Corrigir erros com explicacao do por que.\n- Sinalizar trade-offs e boas praticas.\n- Sugerir mini exercicios e feedback objetivo.\n- Nao inventar factos; quando houver incerteza, indicar explicitamente.\n- Nao terminar a interacao por limite de frases/turnos; continuar ate o estudante confirmar que percebeu.\n\nT - Theme\nAprendizagem de {topic} com foco em compreensao conceitual, pratica guiada e consolidacao.\n\nS - Structure\n1. Entry check: confirmar pre-requisitos.\n2. Exploration: perguntas e intuicao do tema.\n3. Design draft: plano de solucao/resumo mental.\n4. Guided practice: pequenos passos com validacao.\n5. Reflection: o que aprendeu, lacunas e proximo passo.\n6. Conclusao condicionada: so encerrar quando o estudante disser explicitamente que percebeu (ex.: 'percebi', 'entendi').\n\nPrompt pronto para uso:\n\"Usa o contrato PARTS acima e ensina {topic} de forma interativa. Regra obrigatoria: so terminas quando o estudante confirmar que percebeu.\""
     )
 }
 
+/// Inicia o fluxo guiado de criação de contrato PARTS com perguntas sequenciais.
+///
+/// O fluxo depende de `MESSAGE_CONTENT` para receber as respostas do utilizador
+/// via mensagens subsequentes e permite cancelar com reação ❌.
 async fn respond_create_contract(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
@@ -1895,6 +2083,9 @@ async fn respond_create_contract(
     }
 }
 
+/// Processa mensagens do utilizador durante o fluxo guiado de criação de contratos.
+///
+/// Cada mensagem avança uma etapa do contrato PARTS ou finaliza o contrato completo.
 async fn process_contract_message(
     ctx: &Context,
     msg: &Message,
@@ -2048,6 +2239,7 @@ async fn process_contract_message(
             };
 
             let missing_fields: Vec<&str> = vec![
+                ("Título", &title),
                 ("T - Tema", &theme),
                 ("A - Audience (público-alvo)", &audience),
                 ("P - Persona", &persona),
@@ -2089,8 +2281,8 @@ Por favor, completa todos os campos antes de guardar o contrato.",
                 &expectations,
             );
             
-            let title = theme.clone();
-            let topic = audience.clone();
+            let contract_title = title.clone();
+            let topic = theme.clone();
 
             // Publicar o contrato completo numa unica mensagem e deixar apenas duas reacoes finais.
             // Se o texto exceder o limite do Discord, enviamos a versao completa dividida, mas
@@ -2113,7 +2305,7 @@ Por favor, completa todos os campos antes de guardar o contrato.",
                 let mut store = contract_message_store.lock().await;
                 store.insert(
                     last_msg.id.0,
-                    (msg.channel_id.0, msg.author.id.0, String::new(), title.clone(), topic.clone(), contract.clone()),
+                    (msg.channel_id.0, msg.author.id.0, String::new(), contract_title.clone(), topic.clone(), contract.clone()),
                 );
             } else {
                 let _ = msg.channel_id.say(&ctx.http, "Nao consegui publicar o contrato.").await;
@@ -2122,6 +2314,7 @@ Por favor, completa todos os campos antes de guardar o contrato.",
     }
 }
 
+/// Valida a definição de persona usando IA e retorna um veredito curto.
 async fn validate_persona_with_ai(persona: &str) -> String {
     let prompt = format!(
         "Avalia se esta persona para um bot educacional esta bem definida: '{persona}'. \
@@ -2143,6 +2336,7 @@ Responde em portugues de forma curta com este formato exato:\n\
     }
 }
 
+/// Compõe o texto final do contrato PARTS a partir de todos os campos recolhidos.
 fn build_complete_parts_contract(
     theme: &str,
     audience: &str,
@@ -2157,6 +2351,7 @@ fn build_complete_parts_contract(
     )
 }
 
+/// Recupera uma opção de string de um comando slash, retornando `None` para valores vazios.
 fn get_string_option<'a>(
     command: &'a ApplicationCommandInteraction,
     name: &str,
@@ -2172,6 +2367,10 @@ fn get_string_option<'a>(
         .filter(|value| !value.is_empty())
 }
 
+/// Normaliza um ID de contrato para um formato seguro e legível.
+///
+/// Substitui caracteres não alfanuméricos por sublinhados e reduz múltiplos
+/// separadores consecutivos.
 fn normalize_contract_id(raw_id: &str) -> String {
     let trimmed = raw_id.trim();
     if trimmed.is_empty() {
@@ -2195,7 +2394,8 @@ fn normalize_contract_id(raw_id: &str) -> String {
     id.trim_matches('_').to_string()
 }
 
-fn load_conversations_from_disk(storage_path: &str) -> HashMap<ConversationKey, UserConversations> {
+/// Carrega as conversas persistidas do disco e normaliza o histórico.
+fn load_conversations_from_disk(storage_path: &str) -> HashMap<ConversationKey, Vec<ConversationTurn>> {
     let content = match fs::read_to_string(storage_path) {
         Ok(content) => content,
         Err(err) => {
@@ -2222,24 +2422,23 @@ fn load_conversations_from_disk(storage_path: &str) -> HashMap<ConversationKey, 
 
     let mut store = HashMap::new();
     for entry in entries {
-        let mut normalized = entry.data;
-        normalized.ensure_active_exists();
-        store.insert((entry.channel_id, entry.user_id), normalized);
+        store.insert((entry.channel_id, entry.user_id), entry.turns);
     }
 
     store
 }
 
+/// Salva as conversas em disco num ficheiro JSON formatado.
 fn save_conversations_to_disk(
     storage_path: &str,
-    conversations: &HashMap<ConversationKey, UserConversations>,
+    conversations: &HashMap<ConversationKey, Vec<ConversationTurn>>,
 ) -> Result<(), String> {
     let entries: Vec<PersistedConversationEntry> = conversations
         .iter()
-        .map(|((channel_id, user_id), data)| PersistedConversationEntry {
+        .map(|((channel_id, user_id), turns)| PersistedConversationEntry {
             channel_id: *channel_id,
             user_id: *user_id,
-            data: data.clone(),
+            turns: turns.clone(),
         })
         .collect();
 
@@ -2257,6 +2456,7 @@ fn save_conversations_to_disk(
     fs::write(path, json).map_err(|err| format!("Erro a gravar conversas: {err}"))
 }
 
+/// Carrega as sessões de contrato persistidas do disco.
 fn load_contract_sessions_from_disk(
     storage_path: &str,
 ) -> HashMap<ConversationKey, ContractSession> {
@@ -2292,6 +2492,7 @@ fn load_contract_sessions_from_disk(
     store
 }
 
+/// Salva as sessões de contrato em disco num ficheiro JSON formatado.
 fn save_contract_sessions_to_disk(
     storage_path: &str,
     contract_sessions: &HashMap<ConversationKey, ContractSession>,
@@ -2319,6 +2520,7 @@ fn save_contract_sessions_to_disk(
     fs::write(path, json).map_err(|err| format!("Erro a gravar sessoes de contrato: {err}"))
 }
 
+/// Salva as sessões de contrato em disco usando uma cópia do estado atual.
 async fn persist_contract_sessions(contract_sessions: &ContractSessionStore, storage_path: &str) {
     let snapshot = {
         let guard = contract_sessions.lock().await;
@@ -2330,6 +2532,7 @@ async fn persist_contract_sessions(contract_sessions: &ContractSessionStore, sto
     }
 }
 
+/// Carrega o catálogo de contratos persistido do disco.
 fn load_contracts_from_disk(storage_path: &str) -> HashMap<String, StoredContract> {
     let content = match fs::read_to_string(storage_path) {
         Ok(content) => content,
@@ -2363,6 +2566,7 @@ fn load_contracts_from_disk(storage_path: &str) -> HashMap<String, StoredContrac
     store
 }
 
+/// Salva o catálogo de contratos em disco num ficheiro JSON ordenado.
 fn save_contracts_to_disk(
     storage_path: &str,
     contracts: &HashMap<String, StoredContract>,
@@ -2384,6 +2588,7 @@ fn save_contracts_to_disk(
     fs::write(path, json).map_err(|err| format!("Erro a gravar contratos: {err}"))
 }
 
+/// Carrega os resumos de execução de contratos persistidos do disco.
 fn load_execution_summaries_from_disk(storage_path: &str) -> HashMap<String, ContractExecutionSummary> {
     let content = match fs::read_to_string(storage_path) {
         Ok(content) => content,
@@ -2417,6 +2622,7 @@ fn load_execution_summaries_from_disk(storage_path: &str) -> HashMap<String, Con
     store
 }
 
+/// Salva os resumos de execução de contratos em disco num ficheiro JSON ordenado.
 fn save_execution_summaries_to_disk(
     storage_path: &str,
     summaries: &HashMap<String, ContractExecutionSummary>,
@@ -2444,6 +2650,7 @@ fn save_execution_summaries_to_disk(
     fs::write(path, json).map_err(|err| format!("Erro a gravar resumos: {err}"))
 }
 
+/// Persiste os resumos de execução de contratos no disco.
 async fn persist_execution_summaries(
     summaries: &ContractExecutionSummaryStore,
     storage_path: &str,
@@ -2454,10 +2661,12 @@ async fn persist_execution_summaries(
     }
 }
 
+/// Regista um turno de conversa normal em memória e grava o histórico no disco.
+///
+/// Mantém apenas os últimos `MAX_HISTORY_TURNS` turns para limitar o tamanho.
 async fn remember_turn(
     conversations: &ConversationStore,
     key: ConversationKey,
-    conversation_id: &str,
     user_prompt: &str,
     assistant_answer: &str,
     conversations_path: &str,
@@ -2466,21 +2675,12 @@ async fn remember_turn(
     let assistant = truncate_for_history(assistant_answer, MAX_TURN_TEXT_LEN);
     let snapshot = {
         let mut guard = conversations.lock().await;
-        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-        user_conversations.ensure_active_exists();
+        let history = guard.entry(key).or_insert_with(Vec::new);
+        history.push(ConversationTurn { user, assistant });
 
-        let history = user_conversations
-            .conversations
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| StoredConversation {
-                name: conversation_id.replace('_', " "),
-                turns: Vec::new(),
-            });
-        history.turns.push(ConversationTurn { user, assistant });
-
-        if history.turns.len() > MAX_HISTORY_TURNS {
-            let extra = history.turns.len() - MAX_HISTORY_TURNS;
-            history.turns.drain(0..extra);
+        if history.len() > MAX_HISTORY_TURNS {
+            let extra = history.len() - MAX_HISTORY_TURNS;
+            history.drain(0..extra);
         }
 
         guard.clone()
@@ -2491,6 +2691,9 @@ async fn remember_turn(
     }
 }
 
+/// Regista um turno dentro de uma sessão de contrato ativa e persiste a sessão.
+///
+/// Guarda apenas o histórico recente e atualiza o timestamp da sessão.
 async fn remember_contract_session_turn(
     contract_sessions: &ContractSessionStore,
     contract_sessions_path: &str,
@@ -2520,47 +2723,27 @@ async fn remember_contract_session_turn(
     }
 }
 
-async fn respond_conversation_clear(
+/// Responde ao comando `/status` com o estado do bot e da API.
+async fn respond_status(
     ctx: &Context,
     command: &ApplicationCommandInteraction,
-    conversations: &ConversationStore,
-    conversations_path: &str,
 ) {
-    let key = (command.channel_id.0, command.user.id.0);
+    let content = format!("API: {}\nBot: {}", crate::api::status(), status());
 
-    let snapshot = {
-        let mut guard = conversations.lock().await;
-        let user_conversations = guard.entry(key).or_insert_with(UserConversations::new);
-        user_conversations.active_id = DEFAULT_CONVERSATION_ID.to_string();
-        user_conversations.conversations.clear();
-        user_conversations.conversations.insert(
-            DEFAULT_CONVERSATION_ID.to_string(),
-            StoredConversation {
-                name: DEFAULT_CONVERSATION_NAME.to_string(),
-                turns: Vec::new(),
-            },
-        );
-        guard.clone()
-    };
-
-    if let Err(err) = save_conversations_to_disk(conversations_path, &snapshot) {
-        eprintln!("Falha ao limpar conversa principal: {err}");
-    }
-
-    let content = "Conversa principal limpa com sucesso.";
     if let Err(err) = create_interaction_response_in_chunks(
         ctx,
         command,
-        content,
+        &content,
         DISCORD_RESPONSE_CHUNK_LEN,
-        true,
+        false,
     )
     .await
     {
-        eprintln!("Falha ao responder /conversation_clear: {err}");
+        eprintln!("Falha ao responder /status: {err}");
     }
 }
 
+/// Trunca texto para uso em histórico de conversa, mantendo o máximo de caracteres.
 fn truncate_for_history(text: &str, max_len: usize) -> String {
     let trimmed = text.trim();
     if trimmed.chars().count() <= max_len {
@@ -2571,6 +2754,7 @@ fn truncate_for_history(text: &str, max_len: usize) -> String {
     format!("{shortened}...")
 }
 
+/// Trunca texto para envio no Discord, preservando um limite de caracteres compatível.
 fn truncate_for_discord(text: &str, max_len: usize) -> String {
     if text.chars().count() <= max_len {
         return text.to_string();
@@ -2580,6 +2764,9 @@ fn truncate_for_discord(text: &str, max_len: usize) -> String {
     format!("{truncated}...")
 }
 
+/// Parte um texto em múltiplos fragmentos seguros para envio no Discord.
+///
+/// Cada fragmento respeita o limite de comprimento e evita mensagens vazias.
 fn split_text_for_discord(text: &str, max_len: usize) -> Vec<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -2699,6 +2886,7 @@ pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
     let contract_sessions = Arc::new(Mutex::new(loaded_contract_sessions));
     let pending_uploads = Arc::new(Mutex::new(HashMap::new()));
     let contract_message_store = Arc::new(Mutex::new(HashMap::new()));
+    let contract_draft_message_store = Arc::new(Mutex::new(HashMap::new()));
     let contract_summaries = Arc::new(Mutex::new(loaded_summaries));
 
     let mut client = Client::builder(token, intents)
@@ -2713,6 +2901,7 @@ pub async fn run(token: String, guild_id: Option<u64>) -> serenity::Result<()> {
             contract_sessions_path,
             pending_uploads,
             contract_message_store,
+            contract_draft_message_store,
             contract_summaries,
             contract_summaries_path,
             message_content_enabled,
