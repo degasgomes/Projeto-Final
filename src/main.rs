@@ -6,13 +6,27 @@ use axum::{routing::get, Router};
 use std::env;
 use std::net::SocketAddr;
 
+/// Ponto de entrada da aplicação.
+///
+/// Inicializa dois serviços concorrentes:
+/// - servidor HTTP com o endpoint `/status` (útil para health checks e monitorização);
+/// - bot Discord (conecta usando `DISCORD_TOKEN` e regista comandos opcionalmente para
+///   a guild definida por `DISCORD_GUILD_ID`).
+///
+/// Variáveis de ambiente relevantes:
+/// - `DISCORD_TOKEN` (obrigatório): token do bot Discord.
+/// - `DISCORD_GUILD_ID` (opcional): id da guild para registar comandos localmente.
+/// - `PORT` (opcional): porta do servidor HTTP de status (padrão `3000`).
+///
+/// O estado do bot (conversas, contratos e sessões) é mantido em memória e sincronizado
+/// com ficheiros JSON na pasta `data/`. Após alterações nas definições de comandos
+/// do Discord, reinicie a aplicação para propagar as mudanças.
 #[tokio::main]
 async fn main() {
-    // Carrega as variáveis de ambiente antes de iniciar os serviços.
-    // Isso permite que o bot e a API usem token do Discord, porta HTTP e chaves de IA sem recompilar.
     dotenvy::dotenv().ok();
 
-    let token_opt = env::var("DISCORD_TOKEN").ok();
+    let token = env::var("DISCORD_TOKEN")
+        .expect("defina DISCORD_TOKEN para ligar o bot Discord");
 
     let http_port = env::var("PORT")
         .ok()
@@ -27,7 +41,7 @@ async fn main() {
                 .expect("DISCORD_GUILD_ID deve ser um número")
         });
 
-    // O servidor HTTP roda em paralelo para manter o endpoint /status disponível mesmo quando o bot estiver ativo.
+    // servidor HTTP simples que expõe `/status` para health checks
     let api_task = tokio::spawn(async move {
         let app = Router::new().route("/status", get(api::get_status));
         let addr = SocketAddr::from(([127, 0, 0, 1], http_port));
@@ -42,18 +56,13 @@ async fn main() {
             .await
             .expect("falha ao executar servidor HTTP");
     });
-    // Se existir um token do Discord, o bot é iniciado em segundo plano.
-    // Quando o token não está presente, a aplicação continua apenas com a API, o que ajuda em testes locais.
-    if let Some(token) = token_opt {
-        let bot_task = tokio::spawn(async move {
-            bot::run(token, guild_id)
-                .await
-                .expect("falha ao iniciar bot Discord");
-        });
 
-        let _ = tokio::join!(api_task, bot_task);
-    } else {
-        println!("DISCORD_TOKEN não definido — iniciando apenas o servidor HTTP");
-        let _ = api_task.await;
-    }
+    // iniciar o bot Discord (trata eventos e comandos)
+    let bot_task = tokio::spawn(async move {
+        bot::run(token, guild_id)
+            .await
+            .expect("falha ao iniciar bot Discord");
+    });
+
+    let _ = tokio::join!(api_task, bot_task);
 }
